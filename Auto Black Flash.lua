@@ -2,15 +2,62 @@
 	WARNING: Heads up! This script has not been verified by ScriptBlox. Use at your own risk!
 
 	Auto Black Flash
-	Bug-fixed version. See PR description for the list of issues addressed.
+	- Auto-counter: presses the black-flash key when a trigger animation plays.
+	- Auto-combat: finds the nearest player, gets behind them, presses the
+	  black-flash key, then side-dashes and repeats.
+
+	Game binds differ, so edit the CONFIG block below to match your game.
 ]]
 local Players = game:GetService("Players")
 local VirtualInputManager = game:GetService("VirtualInputManager")
 local UserInputService = game:GetService("UserInputService")
+local RunService = game:GetService("RunService")
 local StarterGui = game:GetService("StarterGui")
 
 local player = Players.LocalPlayer
+
+------------------------------------------------------------------------
+-- CONFIG  (edit these to match your game)
+------------------------------------------------------------------------
+local CONFIG = {
+	-- Key that performs the black flash / attack.
+	BLACK_FLASH_KEY = Enum.KeyCode.Three,
+
+	-- Key that performs a dash/dodge in your game (Q is a common default).
+	DASH_KEY = Enum.KeyCode.Q,
+
+	-- How close (in studs) a player must be before auto-combat engages.
+	DETECT_RANGE = 40,
+
+	-- How close you must be to actually land the hit.
+	ATTACK_RANGE = 14,
+
+	-- "Behind" cutoff: dot of the target's look vector and the direction to
+	-- you. -1 = directly behind, 0 = at their side. Lower = stricter.
+	BEHIND_DOT = -0.25,
+
+	-- Timing.
+	HIT_TO_DASH_DELAY = 0.15, -- wait after pressing the key before dashing
+	DASH_HOLD = 0.12,         -- how long the strafe key is held during a dash
+	LOOP_INTERVAL = 0.1,      -- delay between combat-loop iterations
+	PRESS_COOLDOWN = 0.25,    -- min time between key presses (shared)
+
+	-- Toggle each behaviour independently.
+	USE_AUTO_COUNTER = true,
+	USE_AUTO_COMBAT = true,
+}
+
+-- Trigger animations for the auto-counter (animId -> delay before pressing).
+local AnimationTriggers = {
+	["rbxassetid://100962226150441"] = 0.18,
+	["rbxassetid://95852624447551"] = 0.18,
+	["rbxassetid://74145636023952"] = 0.18,
+	["rbxassetid://72475960800126"] = 0.20,
+}
+------------------------------------------------------------------------
+
 local enabled = true
+local destroyed = false
 
 local function notify(title, text, duration)
 	pcall(function()
@@ -28,12 +75,8 @@ notify(
 	6
 )
 
-local AnimationTriggers = {
-	["rbxassetid://100962226150441"] = 0.18,
-	["rbxassetid://95852624447551"] = 0.18,
-	["rbxassetid://74145636023952"] = 0.18,
-	["rbxassetid://72475960800126"] = 0.20,
-}
+-- Shared cooldown so the counter and the combat loop can't stack presses.
+local lastPress = 0
 
 local function pressKey(keyCode)
 	-- Guarantee the key is released even if SendKeyEvent throws mid-press,
@@ -47,11 +90,18 @@ local function pressKey(keyCode)
 	end)
 end
 
--- Cooldown so overlapping / rapidly repeated trigger animations don't queue
--- up multiple key presses at once.
-local lastPress = 0
-local PRESS_COOLDOWN = 0.25
+-- Presses the black-flash key if the shared cooldown allows it. Returns
+-- whether the press actually happened.
+local function tryBlackFlash()
+	if os.clock() - lastPress < CONFIG.PRESS_COOLDOWN then return false end
+	lastPress = os.clock()
+	pressKey(CONFIG.BLACK_FLASH_KEY)
+	return true
+end
 
+------------------------------------------------------------------------
+-- Auto-counter (animation based)
+------------------------------------------------------------------------
 -- Track the current character's connection so respawning doesn't leak an
 -- ever-growing pile of AnimationPlayed listeners.
 local animationConnection
@@ -70,7 +120,7 @@ local function setupCharacter(character)
 	if not animator then return end
 
 	animationConnection = animator.AnimationPlayed:Connect(function(track)
-		if not enabled then return end
+		if not enabled or not CONFIG.USE_AUTO_COUNTER then return end
 		local animation = track and track.Animation
 		if not animation then return end
 
@@ -78,11 +128,9 @@ local function setupCharacter(character)
 		if not delayTime then return end
 
 		task.delay(delayTime, function()
-			if not enabled then return end
+			if not enabled or not CONFIG.USE_AUTO_COUNTER then return end
 			if humanoid.Health <= 0 then return end
-			if os.clock() - lastPress < PRESS_COOLDOWN then return end
-			lastPress = os.clock()
-			pressKey(Enum.KeyCode.Three)
+			tryBlackFlash()
 		end)
 	end)
 end
@@ -97,6 +145,90 @@ player.CharacterAdded:Connect(function(char)
 	setupCharacter(char)
 end)
 
+------------------------------------------------------------------------
+-- Auto-combat (positional): detect nearest player, get behind, hit, dash
+------------------------------------------------------------------------
+local function getMyRoot()
+	local char = player.Character
+	if not char then return nil, nil end
+	local hrp = char:FindFirstChild("HumanoidRootPart")
+	local hum = char:FindFirstChildOfClass("Humanoid")
+	if not hrp or not hum or hum.Health <= 0 then return nil, nil end
+	return hrp, hum
+end
+
+-- Returns the nearest alive enemy's root part and the distance to it.
+local function getNearestTarget(myRoot)
+	local nearestRoot, nearestDist
+	for _, other in ipairs(Players:GetPlayers()) do
+		if other ~= player then
+			local char = other.Character
+			local hrp = char and char:FindFirstChild("HumanoidRootPart")
+			local hum = char and char:FindFirstChildOfClass("Humanoid")
+			if hrp and hum and hum.Health > 0 then
+				local dist = (hrp.Position - myRoot.Position).Magnitude
+				if dist <= CONFIG.DETECT_RANGE and (not nearestDist or dist < nearestDist) then
+					nearestRoot, nearestDist = hrp, dist
+				end
+			end
+		end
+	end
+	return nearestRoot, nearestDist
+end
+
+-- Flatten to the XZ plane and return whether we are behind the target.
+local function isBehind(myRoot, targetRoot)
+	local toMe = myRoot.Position - targetRoot.Position
+	toMe = Vector3.new(toMe.X, 0, toMe.Z)
+	if toMe.Magnitude == 0 then return false end
+	local look = targetRoot.CFrame.LookVector
+	look = Vector3.new(look.X, 0, look.Z)
+	if look.Magnitude == 0 then return false end
+	return look.Unit:Dot(toMe.Unit) <= CONFIG.BEHIND_DOT
+end
+
+-- Alternate the strafe direction each dash so we weave side to side.
+local dashLeft = false
+local function sideDash()
+	dashLeft = not dashLeft
+	local strafe = dashLeft and Enum.KeyCode.A or Enum.KeyCode.D
+	pcall(function()
+		VirtualInputManager:SendKeyEvent(true, strafe, false, game)
+	end)
+	pressKey(CONFIG.DASH_KEY) -- tap dash while holding the strafe direction
+	task.wait(CONFIG.DASH_HOLD)
+	pcall(function()
+		VirtualInputManager:SendKeyEvent(false, strafe, false, game)
+	end)
+end
+
+task.spawn(function()
+	while not destroyed do
+		if enabled and CONFIG.USE_AUTO_COMBAT then
+			local myRoot = getMyRoot()
+			if myRoot then
+				local targetRoot, dist = getNearestTarget(myRoot)
+				if targetRoot and dist <= CONFIG.ATTACK_RANGE then
+					if isBehind(myRoot, targetRoot) then
+						-- Behind them: hit, then reposition and go again.
+						if tryBlackFlash() then
+							task.wait(CONFIG.HIT_TO_DASH_DELAY)
+							sideDash()
+						end
+					else
+						-- Not behind yet: side-dash to try to flank them.
+						sideDash()
+					end
+				end
+			end
+		end
+		task.wait(CONFIG.LOOP_INTERVAL)
+	end
+end)
+
+------------------------------------------------------------------------
+-- GUI
+------------------------------------------------------------------------
 local screenGui = Instance.new("ScreenGui")
 screenGui.Name = "AutoBlackFlash"
 screenGui.ResetOnSpawn = false
@@ -224,6 +356,7 @@ end)
 
 closeButton.MouseButton1Click:Connect(function()
 	enabled = false
+	destroyed = true
 	if animationConnection then
 		animationConnection:Disconnect()
 		animationConnection = nil
