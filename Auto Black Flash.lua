@@ -35,6 +35,7 @@ local CONFIG = {
 	BEHIND_DOT = -0.25,
 
 	-- Timing.
+	BLACK_FLASH_GAP = 0.33,   -- gap between the first and second press of the key
 	HIT_TO_DASH_DELAY = 0.15, -- wait after pressing the key before dashing
 	DASH_HOLD = 0.12,         -- how long the strafe key is held during a dash
 	LOOP_INTERVAL = 0.1,      -- delay between combat-loop iterations
@@ -81,10 +82,15 @@ end
 
 -- Presses the black-flash key if the shared cooldown allows it. Returns
 -- whether the press actually happened.
+-- Black flash is a double-tap: press the key, then press it again after
+-- BLACK_FLASH_GAP seconds.
 local function tryBlackFlash()
 	if os.clock() - lastPress < CONFIG.PRESS_COOLDOWN then return false end
 	lastPress = os.clock()
 	pressKey(CONFIG.BLACK_FLASH_KEY)
+	task.wait(CONFIG.BLACK_FLASH_GAP)
+	pressKey(CONFIG.BLACK_FLASH_KEY)
+	lastPress = os.clock()
 	return true
 end
 
