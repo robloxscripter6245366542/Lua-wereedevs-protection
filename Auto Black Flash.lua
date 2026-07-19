@@ -128,9 +128,9 @@ local function getMyRoot()
 	return hrp, hum
 end
 
--- Returns the nearest alive enemy's root part and the distance to it.
+-- Returns the nearest alive enemy's root part, distance, and humanoid.
 local function getNearestTarget(myRoot)
-	local nearestRoot, nearestDist
+	local nearestRoot, nearestDist, nearestHum
 	for _, other in ipairs(Players:GetPlayers()) do
 		if other ~= player then
 			local char = other.Character
@@ -139,12 +139,12 @@ local function getNearestTarget(myRoot)
 			if hrp and hum and hum.Health > 0 then
 				local dist = (hrp.Position - myRoot.Position).Magnitude
 				if dist <= CONFIG.DETECT_RANGE and (not nearestDist or dist < nearestDist) then
-					nearestRoot, nearestDist = hrp, dist
+					nearestRoot, nearestDist, nearestHum = hrp, dist, hum
 				end
 			end
 		end
 	end
-	return nearestRoot, nearestDist
+	return nearestRoot, nearestDist, nearestHum
 end
 
 -- Flatten to the XZ plane and return whether we are behind the target.
@@ -242,17 +242,75 @@ local function pressToken(token)
 end
 
 -- Build a compact snapshot of the situation for the prompt.
+-- Read a part's world velocity (name differs across Roblox versions).
+local function getVelocity(part)
+	local ok, vel = pcall(function()
+		return part.AssemblyLinearVelocity
+	end)
+	if ok and vel then return vel end
+	return part.Velocity
+end
+
+-- Round to 1 decimal so the prompt stays compact.
+local function r1(n)
+	return math.floor(n * 10 + 0.5) / 10
+end
+
 local function buildState()
-	local myRoot = getMyRoot()
+	local myRoot, myHum = getMyRoot()
 	if not myRoot then return nil end
-	local targetRoot, dist = getNearestTarget(myRoot)
+	local targetRoot, dist, targetHum = getNearestTarget(myRoot)
 	if not targetRoot then
 		return { hasTarget = false }
 	end
+
+	-- Flatten everything to the XZ plane for bearings/movement.
+	local toTarget = targetRoot.Position - myRoot.Position
+	toTarget = Vector3.new(toTarget.X, 0, toTarget.Z)
+	local flatDist = toTarget.Magnitude
+	local dir = flatDist > 0 and toTarget.Unit or Vector3.new(0, 0, 1)
+
+	-- My facing vs. the direction to the target -> front/left/right bearing.
+	local myLook = myRoot.CFrame.LookVector
+	myLook = Vector3.new(myLook.X, 0, myLook.Z)
+	myLook = myLook.Magnitude > 0 and myLook.Unit or Vector3.new(0, 0, 1)
+	local facingDot = myLook:Dot(dir)                 -- 1 = target dead ahead
+	local sideDot = myLook:Cross(dir).Y               -- +y = target on my right
+	local bearing
+	if facingDot > 0.5 then
+		bearing = "front"
+	elseif facingDot < -0.5 then
+		bearing = "behind_me"
+	else
+		bearing = sideDot >= 0 and "right" or "left"
+	end
+
+	-- Enemy movement relative to me: are they closing in or backing off?
+	local enemyVel = getVelocity(targetRoot)
+	local enemyVelFlat = Vector3.new(enemyVel.X, 0, enemyVel.Z)
+	local enemySpeed = enemyVelFlat.Magnitude
+	local approach = -enemyVelFlat:Dot(dir)           -- >0 = moving toward me
+	local enemyMotion
+	if enemySpeed < 2 then
+		enemyMotion = "still"
+	elseif approach > 1 then
+		enemyMotion = "closing"
+	elseif approach < -1 then
+		enemyMotion = "retreating"
+	else
+		enemyMotion = "strafing"
+	end
+
 	return {
 		hasTarget = true,
 		distance = math.floor(dist),
 		behind = isBehind(myRoot, targetRoot),
+		bearing = bearing,                            -- where the enemy is vs my facing
+		enemyMotion = enemyMotion,                    -- still/closing/retreating/strafing
+		enemySpeed = r1(enemySpeed),                  -- studs/sec, flattened
+		mySpeed = r1(getVelocity(myRoot).Magnitude),
+		myHealth = myHum and math.floor(myHum.Health) or 0,
+		enemyHealth = targetHum and math.floor(targetHum.Health) or 0,
 	}
 end
 
@@ -267,12 +325,20 @@ local function askAI(state)
 			.. "Q E R F T G C V Z X B Y (skills/moves), 1 2 3 4 5 6 7 8 9 0 (skill slots), "
 			.. "M1 (light attack click), M2 (heavy/aim click), DASH (dodge), BF (black flash), "
 			.. "WAIT (small pause). Keep it under %d tokens. Chain moves into a real combo. "
-			.. "Situation: hasTarget=%s, distanceStuds=%s, behindEnemy=%s. "
-			.. "Goal: close in, get behind the enemy, then combo into BF.",
+			.. "Situation: distanceStuds=%s, behindEnemy=%s, enemyBearing=%s (where the enemy is "
+			.. "relative to the way I face), enemyMotion=%s, enemySpeed=%s, mySpeed=%s, "
+			.. "myHealth=%s, enemyHealth=%s. "
+			.. "Use the bearing to turn/strafe toward the enemy, chase when they are retreating, "
+			.. "dodge (DASH) when they are closing fast, get behind them, then combo into BF.",
 		CONFIG.MAX_COMBO_INPUTS,
-		tostring(state.hasTarget),
 		tostring(state.distance),
-		tostring(state.behind)
+		tostring(state.behind),
+		tostring(state.bearing),
+		tostring(state.enemyMotion),
+		tostring(state.enemySpeed),
+		tostring(state.mySpeed),
+		tostring(state.myHealth),
+		tostring(state.enemyHealth)
 	)
 
 	local ok, body = pcall(function()
