@@ -4,6 +4,10 @@
 	Auto Black Flash
 	- Auto-combat: finds the nearest player, gets behind them, presses the
 	  black-flash key, then side-dashes and repeats.
+	- AI movement (optional): asks Pollinations AI (Claude model) what to do
+	  each tick and walks/strafes/dashes/attacks based on the reply. Falls
+	  back to the rule-based auto-combat if the executor can't make HTTP
+	  requests or the AI call fails.
 
 	Game binds differ, so edit the CONFIG block below to match your game.
 ]]
@@ -11,8 +15,17 @@ local Players = game:GetService("Players")
 local VirtualInputManager = game:GetService("VirtualInputManager")
 local UserInputService = game:GetService("UserInputService")
 local StarterGui = game:GetService("StarterGui")
+local HttpService = game:GetService("HttpService")
 
 local player = Players.LocalPlayer
+
+-- Executor HTTP request function (name varies between executors). Used only
+-- by the optional AI movement controller; nil on unsupported executors.
+local httpRequest = (syn and syn.request)
+	or (http and http.request)
+	or (fluxus and fluxus.request)
+	or http_request
+	or request
 
 ------------------------------------------------------------------------
 -- CONFIG  (edit these to match your game)
@@ -23,6 +36,9 @@ local CONFIG = {
 
 	-- Key that performs a dash/dodge in your game (Q is a common default).
 	DASH_KEY = Enum.KeyCode.Q,
+
+	-- Key that walks forward.
+	WALK_KEY = Enum.KeyCode.W,
 
 	-- How close (in studs) a player must be before auto-combat engages.
 	DETECT_RANGE = 40,
@@ -38,11 +54,20 @@ local CONFIG = {
 	BLACK_FLASH_GAP = 0.33,   -- gap between the first and second key press
 	HIT_TO_DASH_DELAY = 0.15, -- wait after the black flash before dashing
 	DASH_HOLD = 0.12,         -- how long the strafe key is held during a dash
+	WALK_HOLD = 0.35,         -- how long a walk/strafe step is held
 	LOOP_INTERVAL = 0.1,      -- delay between combat-loop iterations
 	PRESS_COOLDOWN = 0.25,    -- min time between black-flash attempts
 
 	-- Master switch for the positional auto-combat loop.
 	USE_AUTO_COMBAT = true,
+
+	-- Pollinations AI movement controller.
+	USE_AI_MOVEMENT = true,   -- let the AI decide inputs each tick
+	AI_MODEL = "gpt-5.6-sol",  -- model name (see https://text.pollinations.ai/models)
+	AI_ENDPOINT = "https://text.pollinations.ai/openai",
+	AI_INTERVAL = 1.0,        -- seconds between AI decisions (keep >= ~0.8; it's a web call)
+	COMBO_STEP = 0.08,        -- delay between inputs within an AI combo
+	MAX_COMBO_INPUTS = 12,    -- safety cap on how many inputs one combo can fire
 }
 ------------------------------------------------------------------------
 
@@ -148,9 +173,190 @@ local function sideDash()
 	end)
 end
 
+-- Hold a key down for a fixed duration (used for walk/strafe steps).
+local function holdKey(keyCode, duration)
+	pcall(function()
+		VirtualInputManager:SendKeyEvent(true, keyCode, false, game)
+	end)
+	task.wait(duration)
+	pcall(function()
+		VirtualInputManager:SendKeyEvent(false, keyCode, false, game)
+	end)
+end
+
+-- Fire a single mouse-button click at the current cursor position.
+-- button: 0 = left (M1), 1 = right (M2).
+local function clickMouse(button)
+	local pos = UserInputService:GetMouseLocation()
+	pcall(function()
+		VirtualInputManager:SendMouseButtonEvent(pos.X, pos.Y, button, true, game, 0)
+	end)
+	task.wait()
+	pcall(function()
+		VirtualInputManager:SendMouseButtonEvent(pos.X, pos.Y, button, false, game, 0)
+	end)
+end
+
+------------------------------------------------------------------------
+-- AI combo controller (Pollinations AI, Claude model)
+------------------------------------------------------------------------
+-- The AI drives raw inputs through VirtualInputManager. Each tick it returns
+-- a short sequence of input tokens (a combo) which we execute in order.
+
+-- Token -> KeyCode. Digits need naming because Enum.KeyCode["1"] doesn't exist.
+local KEY_MAP = {
+	W = Enum.KeyCode.W, A = Enum.KeyCode.A, S = Enum.KeyCode.S, D = Enum.KeyCode.D,
+	Q = Enum.KeyCode.Q, E = Enum.KeyCode.E, R = Enum.KeyCode.R, F = Enum.KeyCode.F,
+	T = Enum.KeyCode.T, G = Enum.KeyCode.G, C = Enum.KeyCode.C, V = Enum.KeyCode.V,
+	Z = Enum.KeyCode.Z, X = Enum.KeyCode.X, B = Enum.KeyCode.B, Y = Enum.KeyCode.Y,
+	SPACE = Enum.KeyCode.Space, SHIFT = Enum.KeyCode.LeftShift, CTRL = Enum.KeyCode.LeftControl,
+	["1"] = Enum.KeyCode.One, ["2"] = Enum.KeyCode.Two, ["3"] = Enum.KeyCode.Three,
+	["4"] = Enum.KeyCode.Four, ["5"] = Enum.KeyCode.Five, ["6"] = Enum.KeyCode.Six,
+	["7"] = Enum.KeyCode.Seven, ["8"] = Enum.KeyCode.Eight, ["9"] = Enum.KeyCode.Nine,
+	["0"] = Enum.KeyCode.Zero,
+}
+
+-- Every token the AI is allowed to use (keys above plus a few macros).
+local VALID_TOKENS = { M1 = true, M2 = true, DASH = true, BF = true, WALK = true, WAIT = true }
+for token in pairs(KEY_MAP) do
+	VALID_TOKENS[token] = true
+end
+
+-- Perform a single token through VirtualInputManager.
+local function pressToken(token)
+	if token == "M1" then
+		clickMouse(0)
+	elseif token == "M2" then
+		clickMouse(1)
+	elseif token == "DASH" then
+		sideDash()
+	elseif token == "BF" then
+		tryBlackFlash()
+	elseif token == "WALK" then
+		holdKey(CONFIG.WALK_KEY, CONFIG.WALK_HOLD)
+	elseif token == "WAIT" then
+		task.wait(CONFIG.COMBO_STEP)
+	elseif KEY_MAP[token] then
+		pressKey(KEY_MAP[token])
+	end
+end
+
+-- Build a compact snapshot of the situation for the prompt.
+local function buildState()
+	local myRoot = getMyRoot()
+	if not myRoot then return nil end
+	local targetRoot, dist = getNearestTarget(myRoot)
+	if not targetRoot then
+		return { hasTarget = false }
+	end
+	return {
+		hasTarget = true,
+		distance = math.floor(dist),
+		behind = isBehind(myRoot, targetRoot),
+	}
+end
+
+-- Ask Pollinations for a combo. Returns an ordered list of valid tokens.
+local function askAI(state)
+	if not httpRequest then return nil end
+
+	local prompt = string.format(
+		"You control a Roblox anime fighting-game character through VirtualInputManager. "
+			.. "Output a combo as a space-separated sequence of input tokens to run in order, "
+			.. "and NOTHING else. Valid tokens: W A S D (move), SPACE (jump), SHIFT (run), "
+			.. "Q E R F T G C V Z X B Y (skills/moves), 1 2 3 4 5 6 7 8 9 0 (skill slots), "
+			.. "M1 (light attack click), M2 (heavy/aim click), DASH (dodge), BF (black flash), "
+			.. "WAIT (small pause). Keep it under %d tokens. Chain moves into a real combo. "
+			.. "Situation: hasTarget=%s, distanceStuds=%s, behindEnemy=%s. "
+			.. "Goal: close in, get behind the enemy, then combo into BF.",
+		CONFIG.MAX_COMBO_INPUTS,
+		tostring(state.hasTarget),
+		tostring(state.distance),
+		tostring(state.behind)
+	)
+
+	local ok, body = pcall(function()
+		return HttpService:JSONEncode({
+			model = CONFIG.AI_MODEL,
+			messages = { { role = "user", content = prompt } },
+			seed = math.random(1, 1000000),
+		})
+	end)
+	if not ok then return nil end
+
+	local reqOk, res = pcall(function()
+		return httpRequest({
+			Url = CONFIG.AI_ENDPOINT,
+			Method = "POST",
+			Headers = { ["Content-Type"] = "application/json" },
+			Body = body,
+		})
+	end)
+	if not reqOk or type(res) ~= "table" or not res.Body then return nil end
+
+	-- Response may be OpenAI-style JSON or plain text; handle both.
+	local content
+	local decoded
+	pcall(function() decoded = HttpService:JSONDecode(res.Body) end)
+	if decoded and decoded.choices and decoded.choices[1] and decoded.choices[1].message then
+		content = decoded.choices[1].message.content
+	end
+	content = string.upper(content or res.Body or "")
+
+	-- Pull out valid tokens in order, ignoring any extra prose the model adds.
+	local combo = {}
+	for word in string.gmatch(content, "[%w]+") do
+		if VALID_TOKENS[word] then
+			combo[#combo + 1] = word
+			if #combo >= CONFIG.MAX_COMBO_INPUTS then break end
+		end
+	end
+	if #combo == 0 then return nil end
+	return combo
+end
+
+-- Execute a combo token by token, bailing out if we get disabled mid-combo.
+local function executeCombo(combo)
+	for _, token in ipairs(combo) do
+		if destroyed or not enabled then break end
+		pressToken(token)
+		task.wait(CONFIG.COMBO_STEP)
+	end
+end
+
+-- Whether the AI controller is actually driving (needs HTTP support).
+local function aiActive()
+	return CONFIG.USE_AI_MOVEMENT and httpRequest ~= nil
+end
+
+if CONFIG.USE_AI_MOVEMENT and not httpRequest then
+	notify(
+		"Auto Black Flash",
+		"AI movement needs an executor with HTTP support.\nUsing rule-based combat instead.",
+		5
+	)
+end
+
 task.spawn(function()
 	while not destroyed do
-		if enabled and CONFIG.USE_AUTO_COMBAT then
+		if enabled and aiActive() then
+			local state = buildState()
+			if state then
+				local combo = askAI(state)
+				if combo then
+					executeCombo(combo)
+				end
+			end
+		end
+		task.wait(CONFIG.AI_INTERVAL)
+	end
+end)
+
+task.spawn(function()
+	while not destroyed do
+		-- Rule-based combat runs when the AI controller isn't driving (either
+		-- disabled or unsupported on this executor).
+		if enabled and CONFIG.USE_AUTO_COMBAT and not aiActive() then
 			local myRoot = getMyRoot()
 			if myRoot then
 				local targetRoot, dist = getNearestTarget(myRoot)
