@@ -55,14 +55,17 @@ local CONFIG = {
 	HIT_TO_DASH_DELAY = 0.15, -- wait after the black flash before dashing
 	DASH_HOLD = 0.12,         -- how long the strafe key is held during a dash
 	WALK_HOLD = 0.35,         -- how long a walk/strafe step is held
-	LOOP_INTERVAL = 0.1,      -- delay between combat-loop iterations
+	LOOP_INTERVAL = 0.05,     -- delay between combat-loop iterations (fast/local)
 	PRESS_COOLDOWN = 0.25,    -- min time between black-flash attempts
+	FLANK_DASH_COOLDOWN = 0.45, -- min time between flanking dashes
 
 	-- Master switch for the positional auto-combat loop.
 	USE_AUTO_COMBAT = true,
 
-	-- Pollinations AI movement controller.
-	USE_AI_MOVEMENT = true,   -- let the AI decide inputs each tick
+	-- Pollinations AI combo layer. This is an OPTIONAL high-level planner that
+	-- runs in parallel; it can NEVER slow down the fast local movement loop.
+	-- Off by default because a ~1s web call is too slow for real-time control.
+	USE_AI_MOVEMENT = false,  -- let the AI add extra skill combos on top
 	AI_MODEL = "gpt-5.6-sol",  -- model name (see https://text.pollinations.ai/models)
 	AI_ENDPOINT = "https://text.pollinations.ai/openai",
 	AI_INTERVAL = 1.0,        -- seconds between AI decisions (keep >= ~0.8; it's a web call)
@@ -182,6 +185,33 @@ local function holdKey(keyCode, duration)
 	pcall(function()
 		VirtualInputManager:SendKeyEvent(false, keyCode, false, game)
 	end)
+end
+
+-- Continuous key-hold manager for smooth movement. setKey only sends an event
+-- when the desired state actually changes, so a key stays held across ticks
+-- instead of being re-pressed (which is what made movement stutter/lag).
+local heldKeys = {}
+local function setKey(keyCode, shouldHold)
+	if shouldHold and not heldKeys[keyCode] then
+		heldKeys[keyCode] = true
+		pcall(function()
+			VirtualInputManager:SendKeyEvent(true, keyCode, false, game)
+		end)
+	elseif not shouldHold and heldKeys[keyCode] then
+		heldKeys[keyCode] = nil
+		pcall(function()
+			VirtualInputManager:SendKeyEvent(false, keyCode, false, game)
+		end)
+	end
+end
+
+local function releaseAllHeld()
+	for keyCode in pairs(heldKeys) do
+		heldKeys[keyCode] = nil
+		pcall(function()
+			VirtualInputManager:SendKeyEvent(false, keyCode, false, game)
+		end)
+	end
 end
 
 -- Fire a single mouse-button click at the current cursor position.
@@ -398,11 +428,13 @@ end
 if CONFIG.USE_AI_MOVEMENT and not httpRequest then
 	notify(
 		"Auto Black Flash",
-		"AI movement needs an executor with HTTP support.\nUsing rule-based combat instead.",
+		"AI combos need an executor with HTTP support.\nFast local combat still runs.",
 		5
 	)
 end
 
+-- Optional AI combo layer. Runs on its own slow cadence and only ADDS skill
+-- combos; it never gates the fast movement loop below, so it can't slow it.
 task.spawn(function()
 	while not destroyed do
 		if enabled and aiActive() then
@@ -418,27 +450,51 @@ task.spawn(function()
 	end
 end)
 
+-- Fast local combat/movement loop. Fully deterministic and network-free, so
+-- movement stays responsive: it steers by holding W/A/D across ticks (no
+-- re-pressing) and attacks the instant it gets behind the target.
+local lastFlankDash = 0
 task.spawn(function()
 	while not destroyed do
-		-- Rule-based combat runs when the AI controller isn't driving (either
-		-- disabled or unsupported on this executor).
-		if enabled and CONFIG.USE_AUTO_COMBAT and not aiActive() then
+		if enabled and CONFIG.USE_AUTO_COMBAT then
 			local myRoot = getMyRoot()
+			local targetRoot, dist
 			if myRoot then
-				local targetRoot, dist = getNearestTarget(myRoot)
-				if targetRoot and dist <= CONFIG.ATTACK_RANGE then
-					if isBehind(myRoot, targetRoot) then
-						-- Behind them: hit, then reposition and go again.
-						if tryBlackFlash() then
-							task.wait(CONFIG.HIT_TO_DASH_DELAY)
-							sideDash()
-						end
-					else
-						-- Not behind yet: side-dash to try to flank them.
-						sideDash()
+				targetRoot, dist = getNearestTarget(myRoot)
+			end
+
+			if myRoot and targetRoot then
+				if dist > CONFIG.ATTACK_RANGE then
+					-- Chase: hold forward, no strafe.
+					setKey(CONFIG.WALK_KEY, true)
+					setKey(Enum.KeyCode.A, false)
+					setKey(Enum.KeyCode.D, false)
+				elseif isBehind(myRoot, targetRoot) then
+					-- Behind and in range: stop moving and black flash now.
+					setKey(CONFIG.WALK_KEY, false)
+					setKey(Enum.KeyCode.A, false)
+					setKey(Enum.KeyCode.D, false)
+					if tryBlackFlash() then
+						task.wait(CONFIG.HIT_TO_DASH_DELAY)
+					end
+				else
+					-- In range but facing them: circle to flank (forward + one
+					-- strafe direction) and dash around them periodically.
+					setKey(CONFIG.WALK_KEY, true)
+					setKey(Enum.KeyCode.A, dashLeft)
+					setKey(Enum.KeyCode.D, not dashLeft)
+					if os.clock() - lastFlankDash >= CONFIG.FLANK_DASH_COOLDOWN then
+						lastFlankDash = os.clock()
+						dashLeft = not dashLeft
+						pressKey(CONFIG.DASH_KEY)
 					end
 				end
+			else
+				-- No target (or dead): release everything so we don't drift.
+				releaseAllHeld()
 			end
+		else
+			releaseAllHeld()
 		end
 		task.wait(CONFIG.LOOP_INTERVAL)
 	end
@@ -575,6 +631,7 @@ end)
 closeButton.MouseButton1Click:Connect(function()
 	enabled = false
 	destroyed = true
+	releaseAllHeld()
 	if inputChangedConn then
 		inputChangedConn:Disconnect()
 		inputChangedConn = nil
