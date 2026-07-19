@@ -16,6 +16,7 @@ local VirtualInputManager = game:GetService("VirtualInputManager")
 local UserInputService = game:GetService("UserInputService")
 local StarterGui = game:GetService("StarterGui")
 local HttpService = game:GetService("HttpService")
+local RunService = game:GetService("RunService")
 
 local player = Players.LocalPlayer
 
@@ -55,14 +56,17 @@ local CONFIG = {
 	HIT_TO_DASH_DELAY = 0.15, -- wait after the black flash before dashing
 	DASH_HOLD = 0.12,         -- how long the strafe key is held during a dash
 	WALK_HOLD = 0.35,         -- how long a walk/strafe step is held
-	LOOP_INTERVAL = 0.1,      -- delay between combat-loop iterations
+	LOOP_INTERVAL = 0.05,     -- delay between combat-loop iterations (fast/local)
 	PRESS_COOLDOWN = 0.25,    -- min time between black-flash attempts
+	FLANK_DASH_COOLDOWN = 0.45, -- min time between flanking dashes
 
 	-- Master switch for the positional auto-combat loop.
 	USE_AUTO_COMBAT = true,
 
-	-- Pollinations AI movement controller.
-	USE_AI_MOVEMENT = true,   -- let the AI decide inputs each tick
+	-- Pollinations AI combo layer. This is an OPTIONAL high-level planner that
+	-- runs in parallel; it can NEVER slow down the fast local movement loop.
+	-- Off by default because a ~1s web call is too slow for real-time control.
+	USE_AI_MOVEMENT = false,  -- let the AI add extra skill combos on top
 	AI_MODEL = "gpt-5.6-sol",  -- model name (see https://text.pollinations.ai/models)
 	AI_ENDPOINT = "https://text.pollinations.ai/openai",
 	AI_INTERVAL = 1.0,        -- seconds between AI decisions (keep >= ~0.8; it's a web call)
@@ -184,6 +188,19 @@ local function holdKey(keyCode, duration)
 	end)
 end
 
+-- Movement is driven through Humanoid:Move (world-space, reliable) instead of
+-- simulated W/A/D key signals, which executors often drop unless the Roblox
+-- window is focused. Stop the character by moving in no direction.
+local function stopMoving()
+	local char = player.Character
+	local hum = char and char:FindFirstChildOfClass("Humanoid")
+	if hum then
+		pcall(function()
+			hum:Move(Vector3.new(0, 0, 0), false)
+		end)
+	end
+end
+
 -- Fire a single mouse-button click at the current cursor position.
 -- button: 0 = left (M1), 1 = right (M2).
 local function clickMouse(button)
@@ -203,18 +220,24 @@ end
 -- The AI drives raw inputs through VirtualInputManager. Each tick it returns
 -- a short sequence of input tokens (a combo) which we execute in order.
 
--- Token -> KeyCode. Digits need naming because Enum.KeyCode["1"] doesn't exist.
-local KEY_MAP = {
-	W = Enum.KeyCode.W, A = Enum.KeyCode.A, S = Enum.KeyCode.S, D = Enum.KeyCode.D,
-	Q = Enum.KeyCode.Q, E = Enum.KeyCode.E, R = Enum.KeyCode.R, F = Enum.KeyCode.F,
-	T = Enum.KeyCode.T, G = Enum.KeyCode.G, C = Enum.KeyCode.C, V = Enum.KeyCode.V,
-	Z = Enum.KeyCode.Z, X = Enum.KeyCode.X, B = Enum.KeyCode.B, Y = Enum.KeyCode.Y,
-	SPACE = Enum.KeyCode.Space, SHIFT = Enum.KeyCode.LeftShift, CTRL = Enum.KeyCode.LeftControl,
+-- Token -> KeyCode covering the WHOLE keyboard. Built from every Enum.KeyCode
+-- (addressed by its name uppercased: A, F, SPACE, LEFTSHIFT, RETURN, F1 ...),
+-- then friendly aliases the model is likely to use (digits, SHIFT, ENTER ...).
+local KEY_MAP = {}
+for _, kc in ipairs(Enum.KeyCode:GetEnumItems()) do
+	KEY_MAP[string.upper(kc.Name)] = kc
+end
+local KEY_ALIASES = {
 	["1"] = Enum.KeyCode.One, ["2"] = Enum.KeyCode.Two, ["3"] = Enum.KeyCode.Three,
 	["4"] = Enum.KeyCode.Four, ["5"] = Enum.KeyCode.Five, ["6"] = Enum.KeyCode.Six,
 	["7"] = Enum.KeyCode.Seven, ["8"] = Enum.KeyCode.Eight, ["9"] = Enum.KeyCode.Nine,
 	["0"] = Enum.KeyCode.Zero,
+	SHIFT = Enum.KeyCode.LeftShift, CTRL = Enum.KeyCode.LeftControl,
+	ALT = Enum.KeyCode.LeftAlt, ENTER = Enum.KeyCode.Return, ESC = Enum.KeyCode.Escape,
 }
+for token, kc in pairs(KEY_ALIASES) do
+	KEY_MAP[token] = kc
+end
 
 -- Every token the AI is allowed to use (keys above plus a few macros).
 local VALID_TOKENS = { M1 = true, M2 = true, DASH = true, BF = true, WALK = true, WAIT = true }
@@ -321,10 +344,13 @@ local function askAI(state)
 	local prompt = string.format(
 		"You control a Roblox anime fighting-game character through VirtualInputManager. "
 			.. "Output a combo as a space-separated sequence of input tokens to run in order, "
-			.. "and NOTHING else. Valid tokens: W A S D (move), SPACE (jump), SHIFT (run), "
-			.. "Q E R F T G C V Z X B Y (skills/moves), 1 2 3 4 5 6 7 8 9 0 (skill slots), "
-			.. "M1 (light attack click), M2 (heavy/aim click), DASH (dodge), BF (black flash), "
-			.. "WAIT (small pause). Keep it under %d tokens. Chain moves into a real combo. "
+			.. "and NOTHING else. You have the WHOLE keyboard: any letter A-Z, any number "
+			.. "0-9, F1-F12, SPACE, SHIFT, CTRL, ALT, ENTER, ESC, TAB, and the arrow keys "
+			.. "(UP DOWN LEFT RIGHT) all press that key. Plus macros: M1 (light attack click), "
+			.. "M2 (heavy/aim click), DASH (dodge), BF (black flash), WALK (step forward), "
+			.. "WAIT (small pause). Typical binds: W A S D move, SPACE jump, and skills are "
+			.. "usually on the number row and letters like Q E R F. "
+			.. "Keep it under %d tokens. Chain inputs into a real combo. "
 			.. "Situation: distanceStuds=%s, behindEnemy=%s, enemyBearing=%s (where the enemy is "
 			.. "relative to the way I face), enemyMotion=%s, enemySpeed=%s, mySpeed=%s, "
 			.. "myHealth=%s, enemyHealth=%s. "
@@ -398,11 +424,13 @@ end
 if CONFIG.USE_AI_MOVEMENT and not httpRequest then
 	notify(
 		"Auto Black Flash",
-		"AI movement needs an executor with HTTP support.\nUsing rule-based combat instead.",
+		"AI combos need an executor with HTTP support.\nFast local combat still runs.",
 		5
 	)
 end
 
+-- Optional AI combo layer. Runs on its own slow cadence and only ADDS skill
+-- combos; it never gates the fast movement loop below, so it can't slow it.
 task.spawn(function()
 	while not destroyed do
 		if enabled and aiActive() then
@@ -418,29 +446,56 @@ task.spawn(function()
 	end
 end)
 
-task.spawn(function()
-	while not destroyed do
-		-- Rule-based combat runs when the AI controller isn't driving (either
-		-- disabled or unsupported on this executor).
-		if enabled and CONFIG.USE_AUTO_COMBAT and not aiActive() then
-			local myRoot = getMyRoot()
-			if myRoot then
-				local targetRoot, dist = getNearestTarget(myRoot)
-				if targetRoot and dist <= CONFIG.ATTACK_RANGE then
-					if isBehind(myRoot, targetRoot) then
-						-- Behind them: hit, then reposition and go again.
-						if tryBlackFlash() then
-							task.wait(CONFIG.HIT_TO_DASH_DELAY)
-							sideDash()
-						end
-					else
-						-- Not behind yet: side-dash to try to flank them.
-						sideDash()
-					end
-				end
-			end
-		end
-		task.wait(CONFIG.LOOP_INTERVAL)
+-- Fast local combat/movement loop on Heartbeat (runs every frame, network-free
+-- and independent of window focus). It reads the live character positions each
+-- frame, walks the character straight to a spot behind the enemy with
+-- Humanoid:Move, and black-flashes the instant it is behind and in range.
+local lastFlankDash = 0
+local combatConnection
+combatConnection = RunService.Heartbeat:Connect(function()
+	if destroyed then return end
+	if not (enabled and CONFIG.USE_AUTO_COMBAT) then
+		stopMoving()
+		return
+	end
+
+	local myRoot, myHum = getMyRoot()
+	local targetRoot, dist
+	if myRoot then
+		targetRoot, dist = getNearestTarget(myRoot)
+	end
+
+	if not (myRoot and myHum and targetRoot) then
+		stopMoving()
+		return
+	end
+
+	-- Aim for a point directly behind the enemy (opposite their facing).
+	local behindOffset = targetRoot.CFrame.LookVector * (CONFIG.ATTACK_RANGE * 0.5)
+	local goalPos = targetRoot.Position - behindOffset
+	local toGoal = goalPos - myRoot.Position
+	toGoal = Vector3.new(toGoal.X, 0, toGoal.Z)
+
+	if toGoal.Magnitude > 2 then
+		pcall(function()
+			myHum:Move(toGoal.Unit, false)
+		end)
+	else
+		pcall(function()
+			myHum:Move(Vector3.new(0, 0, 0), false)
+		end)
+	end
+
+	-- Attack the instant we're behind and close. Spawn it so the black-flash
+	-- timing (task.wait) never stalls this per-frame movement handler.
+	if isBehind(myRoot, targetRoot) and dist <= CONFIG.ATTACK_RANGE then
+		task.spawn(tryBlackFlash)
+	elseif dist > CONFIG.ATTACK_RANGE and os.clock() - lastFlankDash >= CONFIG.FLANK_DASH_COOLDOWN then
+		-- Dash to close the gap faster while chasing.
+		lastFlankDash = os.clock()
+		task.spawn(function()
+			pressKey(CONFIG.DASH_KEY)
+		end)
 	end
 end)
 
@@ -575,6 +630,11 @@ end)
 closeButton.MouseButton1Click:Connect(function()
 	enabled = false
 	destroyed = true
+	if combatConnection then
+		combatConnection:Disconnect()
+		combatConnection = nil
+	end
+	stopMoving()
 	if inputChangedConn then
 		inputChangedConn:Disconnect()
 		inputChangedConn = nil
