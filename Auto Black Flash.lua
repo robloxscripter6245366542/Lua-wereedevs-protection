@@ -2,12 +2,13 @@
 	WARNING: Heads up! This script has not been verified by ScriptBlox. Use at your own risk!
 
 	Auto Black Flash
-	- Auto-combat: finds the nearest player, gets behind them, presses the
-	  black-flash key, then side-dashes and repeats.
-	- AI movement (optional): asks Pollinations AI (Claude model) what to do
-	  each tick and walks/strafes/dashes/attacks based on the reply. Falls
-	  back to the rule-based auto-combat if the executor can't make HTTP
-	  requests or the AI call fails.
+	- Auto-combat: locks the nearest valid enemy, walks to a spot behind them
+	  (leading their movement), and black-flashes the instant it's behind and
+	  in range.
+	- Movement is driven by Humanoid:Move with the default controls disabled,
+	  so it's smooth and doesn't depend on the Roblox window being focused.
+	- AI combos (optional): asks Pollinations AI for a keyboard combo each tick
+	  and plays it on top. Off by default (a web call is too slow for real-time).
 
 	Game binds differ, so edit the CONFIG block below to match your game.
 ]]
@@ -21,7 +22,7 @@ local RunService = game:GetService("RunService")
 local player = Players.LocalPlayer
 
 -- Executor HTTP request function (name varies between executors). Used only
--- by the optional AI movement controller; nil on unsupported executors.
+-- by the optional AI combo layer; nil on unsupported executors.
 local httpRequest = (syn and syn.request)
 	or (http and http.request)
 	or (fluxus and fluxus.request)
@@ -38,38 +39,42 @@ local CONFIG = {
 	-- Key that performs a dash/dodge in your game (Q is a common default).
 	DASH_KEY = Enum.KeyCode.Q,
 
-	-- Key that walks forward.
+	-- Key that walks forward (used by the AI WALK macro only).
 	WALK_KEY = Enum.KeyCode.W,
 
-	-- How close (in studs) a player must be before auto-combat engages.
-	DETECT_RANGE = 40,
+	-- Press this to toggle the bot on/off in-game.
+	TOGGLE_KEY = Enum.KeyCode.RightControl,
 
-	-- How close you must be to actually land the hit.
-	ATTACK_RANGE = 14,
+	-- Targeting.
+	DETECT_RANGE = 60,        -- how far to look for an enemy (studs)
+	ATTACK_RANGE = 14,        -- how close before we try to hit
+	IGNORE_TEAMMATES = true,  -- don't target players on your own team
+	IGNORE_FORCEFIELD = true, -- don't target spawn-protected players
 
 	-- "Behind" cutoff: dot of the target's look vector and the direction to
 	-- you. -1 = directly behind, 0 = at their side. Lower = stricter.
 	BEHIND_DOT = -0.25,
 
+	-- Movement.
+	PREDICT_TIME = 0.12,      -- lead the target's velocity by this many seconds
+	BEHIND_OFFSET = 7,        -- how far behind the enemy to stand (studs)
+
 	-- Timing.
 	BLACK_FLASH_GAP = 0.33,   -- gap between the first and second key press
-	HIT_TO_DASH_DELAY = 0.15, -- wait after the black flash before dashing
 	DASH_HOLD = 0.12,         -- how long the strafe key is held during a dash
-	WALK_HOLD = 0.35,         -- how long a walk/strafe step is held
-	LOOP_INTERVAL = 0.05,     -- delay between combat-loop iterations (fast/local)
+	WALK_HOLD = 0.35,         -- how long the AI WALK macro holds forward
 	PRESS_COOLDOWN = 0.25,    -- min time between black-flash attempts
-	FLANK_DASH_COOLDOWN = 0.45, -- min time between flanking dashes
+	FLANK_DASH_COOLDOWN = 0.45, -- min time between chase dashes
 
 	-- Master switch for the positional auto-combat loop.
 	USE_AUTO_COMBAT = true,
 
-	-- Pollinations AI combo layer. This is an OPTIONAL high-level planner that
-	-- runs in parallel; it can NEVER slow down the fast local movement loop.
-	-- Off by default because a ~1s web call is too slow for real-time control.
-	USE_AI_MOVEMENT = false,  -- let the AI add extra skill combos on top
-	AI_MODEL = "gpt-5.6-sol",  -- model name (see https://text.pollinations.ai/models)
+	-- Pollinations AI combo layer. Optional high-level planner that runs in
+	-- parallel; it can NEVER slow the fast local loop. Off by default.
+	USE_AI_MOVEMENT = false,
+	AI_MODEL = "gpt-5.6-sol", -- model name (see https://text.pollinations.ai/models)
 	AI_ENDPOINT = "https://text.pollinations.ai/openai",
-	AI_INTERVAL = 1.0,        -- seconds between AI decisions (keep >= ~0.8; it's a web call)
+	AI_INTERVAL = 1.0,        -- seconds between AI decisions (>= ~0.8; it's a web call)
 	COMBO_STEP = 0.08,        -- delay between inputs within an AI combo
 	MAX_COMBO_INPUTS = 12,    -- safety cap on how many inputs one combo can fire
 }
@@ -90,22 +95,44 @@ end
 
 notify(
 	"Auto Black Flash",
-	"Loaded!\nClick button to toggle\nDrag by title • X to close (disables BF)",
+	("Loaded!\nToggle: button or [%s]\nDrag by title • X to close"):format(CONFIG.TOGGLE_KEY.Name),
 	6
 )
 
--- Cooldown so the combat loop can't stack presses on top of each other.
+------------------------------------------------------------------------
+-- Low-level input
+------------------------------------------------------------------------
 local lastPress = 0
 
 local function pressKey(keyCode)
-	-- Guarantee the key is released even if SendKeyEvent throws mid-press,
-	-- otherwise the key can get "stuck" down.
+	-- Release inside pcall too, so a mid-press error can't leave a key stuck.
 	pcall(function()
 		VirtualInputManager:SendKeyEvent(true, keyCode, false, game)
 	end)
 	task.wait()
 	pcall(function()
 		VirtualInputManager:SendKeyEvent(false, keyCode, false, game)
+	end)
+end
+
+local function holdKey(keyCode, duration)
+	pcall(function()
+		VirtualInputManager:SendKeyEvent(true, keyCode, false, game)
+	end)
+	task.wait(duration)
+	pcall(function()
+		VirtualInputManager:SendKeyEvent(false, keyCode, false, game)
+	end)
+end
+
+local function clickMouse(button)
+	local pos = UserInputService:GetMouseLocation()
+	pcall(function()
+		VirtualInputManager:SendMouseButtonEvent(pos.X, pos.Y, button, true, game, 0)
+	end)
+	task.wait()
+	pcall(function()
+		VirtualInputManager:SendMouseButtonEvent(pos.X, pos.Y, button, false, game, 0)
 	end)
 end
 
@@ -120,8 +147,57 @@ local function tryBlackFlash()
 	return true
 end
 
+local dashLeft = false
+local function sideDash()
+	dashLeft = not dashLeft
+	local strafe = dashLeft and Enum.KeyCode.A or Enum.KeyCode.D
+	pcall(function()
+		VirtualInputManager:SendKeyEvent(true, strafe, false, game)
+	end)
+	pressKey(CONFIG.DASH_KEY)
+	task.wait(CONFIG.DASH_HOLD)
+	pcall(function()
+		VirtualInputManager:SendKeyEvent(false, strafe, false, game)
+	end)
+end
+
 ------------------------------------------------------------------------
--- Auto-combat (positional): detect nearest player, get behind, hit, dash
+-- Default-controls management
+------------------------------------------------------------------------
+-- Humanoid:Move fights the default control script (which zeroes movement each
+-- frame). Disabling the controls while the bot drives makes movement smooth;
+-- we always hand control back when idle, disabled, or closed.
+local controlsModule
+local function getControls()
+	if controlsModule then return controlsModule end
+	pcall(function()
+		local pm = require(player:WaitForChild("PlayerScripts"):WaitForChild("PlayerModule"))
+		controlsModule = pm:GetControls()
+	end)
+	return controlsModule
+end
+
+local controlsDisabled = false
+local function setControls(disable)
+	local controls = getControls()
+	if not controls then return end
+	if disable and not controlsDisabled then
+		controlsDisabled = true
+		pcall(function() controls:Disable() end)
+	elseif not disable and controlsDisabled then
+		controlsDisabled = false
+		pcall(function() controls:Enable() end)
+	end
+end
+
+-- A fresh character spawns with controls enabled again; forget our stale flag
+-- so the next drive re-disables them.
+player.CharacterAdded:Connect(function()
+	controlsDisabled = false
+end)
+
+------------------------------------------------------------------------
+-- Targeting / geometry
 ------------------------------------------------------------------------
 local function getMyRoot()
 	local char = player.Character
@@ -132,23 +208,35 @@ local function getMyRoot()
 	return hrp, hum
 end
 
--- Returns the nearest alive enemy's root part, distance, and humanoid.
+local function isValidEnemy(other)
+	if other == player then return false end
+	if CONFIG.IGNORE_TEAMMATES and player.Team and other.Team == player.Team then
+		return false
+	end
+	local char = other.Character
+	if not char then return nil end
+	if CONFIG.IGNORE_FORCEFIELD and char:FindFirstChildOfClass("ForceField") then
+		return false
+	end
+	local hrp = char:FindFirstChild("HumanoidRootPart")
+	local hum = char:FindFirstChildOfClass("Humanoid")
+	if not hrp or not hum or hum.Health <= 0 then return false end
+	return true, hrp, hum
+end
+
+-- Returns nearest enemy's root part, distance, humanoid, and player.
 local function getNearestTarget(myRoot)
-	local nearestRoot, nearestDist, nearestHum
+	local bestRoot, bestDist, bestHum, bestPlayer
 	for _, other in ipairs(Players:GetPlayers()) do
-		if other ~= player then
-			local char = other.Character
-			local hrp = char and char:FindFirstChild("HumanoidRootPart")
-			local hum = char and char:FindFirstChildOfClass("Humanoid")
-			if hrp and hum and hum.Health > 0 then
-				local dist = (hrp.Position - myRoot.Position).Magnitude
-				if dist <= CONFIG.DETECT_RANGE and (not nearestDist or dist < nearestDist) then
-					nearestRoot, nearestDist, nearestHum = hrp, dist, hum
-				end
+		local ok, hrp, hum = isValidEnemy(other)
+		if ok then
+			local dist = (hrp.Position - myRoot.Position).Magnitude
+			if dist <= CONFIG.DETECT_RANGE and (not bestDist or dist < bestDist) then
+				bestRoot, bestDist, bestHum, bestPlayer = hrp, dist, hum, other
 			end
 		end
 	end
-	return nearestRoot, nearestDist, nearestHum
+	return bestRoot, bestDist, bestHum, bestPlayer
 end
 
 -- Flatten to the XZ plane and return whether we are behind the target.
@@ -162,67 +250,82 @@ local function isBehind(myRoot, targetRoot)
 	return look.Unit:Dot(toMe.Unit) <= CONFIG.BEHIND_DOT
 end
 
--- Alternate the strafe direction each dash so we weave side to side.
-local dashLeft = false
-local function sideDash()
-	dashLeft = not dashLeft
-	local strafe = dashLeft and Enum.KeyCode.A or Enum.KeyCode.D
-	pcall(function()
-		VirtualInputManager:SendKeyEvent(true, strafe, false, game)
+local function getVelocity(part)
+	local ok, vel = pcall(function()
+		return part.AssemblyLinearVelocity
 	end)
-	pressKey(CONFIG.DASH_KEY) -- tap dash while holding the strafe direction
-	task.wait(CONFIG.DASH_HOLD)
+	if ok and vel then return vel end
+	return part.Velocity
+end
+
+local function stopMovingHumanoid(hum)
 	pcall(function()
-		VirtualInputManager:SendKeyEvent(false, strafe, false, game)
+		hum:Move(Vector3.new(0, 0, 0), false)
 	end)
 end
 
--- Hold a key down for a fixed duration (used for walk/strafe steps).
-local function holdKey(keyCode, duration)
-	pcall(function()
-		VirtualInputManager:SendKeyEvent(true, keyCode, false, game)
-	end)
-	task.wait(duration)
-	pcall(function()
-		VirtualInputManager:SendKeyEvent(false, keyCode, false, game)
-	end)
-end
+------------------------------------------------------------------------
+-- Fast local combat/movement loop (Heartbeat: every frame, network-free)
+------------------------------------------------------------------------
+local lastFlankDash = 0
+local combatConnection
+combatConnection = RunService.Heartbeat:Connect(function()
+	if destroyed then return end
 
--- Movement is driven through Humanoid:Move (world-space, reliable) instead of
--- simulated W/A/D key signals, which executors often drop unless the Roblox
--- window is focused. Stop the character by moving in no direction.
-local function stopMoving()
-	local char = player.Character
-	local hum = char and char:FindFirstChildOfClass("Humanoid")
-	if hum then
+	if not (enabled and CONFIG.USE_AUTO_COMBAT) then
+		setControls(false) -- give control back to the player
+		return
+	end
+
+	local myRoot, myHum = getMyRoot()
+	local targetRoot, dist
+	if myRoot then
+		targetRoot, dist = getNearestTarget(myRoot)
+	end
+
+	if not (myRoot and myHum and targetRoot) then
+		setControls(false) -- no target: let the player move freely
+		return
+	end
+
+	-- We have a target: take over movement.
+	setControls(true)
+
+	-- Lead the enemy's motion, then aim for a point behind their facing.
+	local predicted = targetRoot.Position + getVelocity(targetRoot) * CONFIG.PREDICT_TIME
+	local behindOffset = targetRoot.CFrame.LookVector * CONFIG.BEHIND_OFFSET
+	local goalPos = predicted - behindOffset
+	local toGoal = goalPos - myRoot.Position
+	toGoal = Vector3.new(toGoal.X, 0, toGoal.Z)
+
+	if toGoal.Magnitude > 2 then
 		pcall(function()
-			hum:Move(Vector3.new(0, 0, 0), false)
+			myHum:Move(toGoal.Unit, false)
+		end)
+	else
+		stopMovingHumanoid(myHum)
+	end
+
+	-- Attack when behind and close. Guard on the cooldown BEFORE spawning so we
+	-- don't spawn a throwaway thread every frame.
+	if isBehind(myRoot, targetRoot) and dist <= CONFIG.ATTACK_RANGE then
+		if os.clock() - lastPress >= CONFIG.PRESS_COOLDOWN then
+			task.spawn(tryBlackFlash)
+		end
+	elseif dist > CONFIG.ATTACK_RANGE and os.clock() - lastFlankDash >= CONFIG.FLANK_DASH_COOLDOWN then
+		-- Dash to close the gap faster while chasing.
+		lastFlankDash = os.clock()
+		task.spawn(function()
+			pressKey(CONFIG.DASH_KEY)
 		end)
 	end
-end
-
--- Fire a single mouse-button click at the current cursor position.
--- button: 0 = left (M1), 1 = right (M2).
-local function clickMouse(button)
-	local pos = UserInputService:GetMouseLocation()
-	pcall(function()
-		VirtualInputManager:SendMouseButtonEvent(pos.X, pos.Y, button, true, game, 0)
-	end)
-	task.wait()
-	pcall(function()
-		VirtualInputManager:SendMouseButtonEvent(pos.X, pos.Y, button, false, game, 0)
-	end)
-end
+end)
 
 ------------------------------------------------------------------------
--- AI combo controller (Pollinations AI, Claude model)
+-- Optional AI combo layer (Pollinations)
 ------------------------------------------------------------------------
--- The AI drives raw inputs through VirtualInputManager. Each tick it returns
--- a short sequence of input tokens (a combo) which we execute in order.
-
--- Token -> KeyCode covering the WHOLE keyboard. Built from every Enum.KeyCode
--- (addressed by its name uppercased: A, F, SPACE, LEFTSHIFT, RETURN, F1 ...),
--- then friendly aliases the model is likely to use (digits, SHIFT, ENTER ...).
+-- Token -> KeyCode covering the WHOLE keyboard, built from every Enum.KeyCode
+-- (addressed by its name uppercased), plus friendly aliases.
 local KEY_MAP = {}
 for _, kc in ipairs(Enum.KeyCode:GetEnumItems()) do
 	KEY_MAP[string.upper(kc.Name)] = kc
@@ -239,13 +342,11 @@ for token, kc in pairs(KEY_ALIASES) do
 	KEY_MAP[token] = kc
 end
 
--- Every token the AI is allowed to use (keys above plus a few macros).
 local VALID_TOKENS = { M1 = true, M2 = true, DASH = true, BF = true, WALK = true, WAIT = true }
 for token in pairs(KEY_MAP) do
 	VALID_TOKENS[token] = true
 end
 
--- Perform a single token through VirtualInputManager.
 local function pressToken(token)
 	if token == "M1" then
 		clickMouse(0)
@@ -264,17 +365,6 @@ local function pressToken(token)
 	end
 end
 
--- Build a compact snapshot of the situation for the prompt.
--- Read a part's world velocity (name differs across Roblox versions).
-local function getVelocity(part)
-	local ok, vel = pcall(function()
-		return part.AssemblyLinearVelocity
-	end)
-	if ok and vel then return vel end
-	return part.Velocity
-end
-
--- Round to 1 decimal so the prompt stays compact.
 local function r1(n)
 	return math.floor(n * 10 + 0.5) / 10
 end
@@ -287,18 +377,15 @@ local function buildState()
 		return { hasTarget = false }
 	end
 
-	-- Flatten everything to the XZ plane for bearings/movement.
 	local toTarget = targetRoot.Position - myRoot.Position
 	toTarget = Vector3.new(toTarget.X, 0, toTarget.Z)
-	local flatDist = toTarget.Magnitude
-	local dir = flatDist > 0 and toTarget.Unit or Vector3.new(0, 0, 1)
+	local dir = toTarget.Magnitude > 0 and toTarget.Unit or Vector3.new(0, 0, 1)
 
-	-- My facing vs. the direction to the target -> front/left/right bearing.
 	local myLook = myRoot.CFrame.LookVector
 	myLook = Vector3.new(myLook.X, 0, myLook.Z)
 	myLook = myLook.Magnitude > 0 and myLook.Unit or Vector3.new(0, 0, 1)
-	local facingDot = myLook:Dot(dir)                 -- 1 = target dead ahead
-	local sideDot = myLook:Cross(dir).Y               -- +y = target on my right
+	local facingDot = myLook:Dot(dir)
+	local sideDot = myLook:Cross(dir).Y
 	local bearing
 	if facingDot > 0.5 then
 		bearing = "front"
@@ -308,11 +395,10 @@ local function buildState()
 		bearing = sideDot >= 0 and "right" or "left"
 	end
 
-	-- Enemy movement relative to me: are they closing in or backing off?
 	local enemyVel = getVelocity(targetRoot)
 	local enemyVelFlat = Vector3.new(enemyVel.X, 0, enemyVel.Z)
 	local enemySpeed = enemyVelFlat.Magnitude
-	local approach = -enemyVelFlat:Dot(dir)           -- >0 = moving toward me
+	local approach = -enemyVelFlat:Dot(dir)
 	local enemyMotion
 	if enemySpeed < 2 then
 		enemyMotion = "still"
@@ -328,16 +414,15 @@ local function buildState()
 		hasTarget = true,
 		distance = math.floor(dist),
 		behind = isBehind(myRoot, targetRoot),
-		bearing = bearing,                            -- where the enemy is vs my facing
-		enemyMotion = enemyMotion,                    -- still/closing/retreating/strafing
-		enemySpeed = r1(enemySpeed),                  -- studs/sec, flattened
+		bearing = bearing,
+		enemyMotion = enemyMotion,
+		enemySpeed = r1(enemySpeed),
 		mySpeed = r1(getVelocity(myRoot).Magnitude),
 		myHealth = myHum and math.floor(myHum.Health) or 0,
 		enemyHealth = targetHum and math.floor(targetHum.Health) or 0,
 	}
 end
 
--- Ask Pollinations for a combo. Returns an ordered list of valid tokens.
 local function askAI(state)
 	if not httpRequest then return nil end
 
@@ -348,14 +433,11 @@ local function askAI(state)
 			.. "0-9, F1-F12, SPACE, SHIFT, CTRL, ALT, ENTER, ESC, TAB, and the arrow keys "
 			.. "(UP DOWN LEFT RIGHT) all press that key. Plus macros: M1 (light attack click), "
 			.. "M2 (heavy/aim click), DASH (dodge), BF (black flash), WALK (step forward), "
-			.. "WAIT (small pause). Typical binds: W A S D move, SPACE jump, and skills are "
-			.. "usually on the number row and letters like Q E R F. "
-			.. "Keep it under %d tokens. Chain inputs into a real combo. "
-			.. "Situation: distanceStuds=%s, behindEnemy=%s, enemyBearing=%s (where the enemy is "
-			.. "relative to the way I face), enemyMotion=%s, enemySpeed=%s, mySpeed=%s, "
-			.. "myHealth=%s, enemyHealth=%s. "
-			.. "Use the bearing to turn/strafe toward the enemy, chase when they are retreating, "
-			.. "dodge (DASH) when they are closing fast, get behind them, then combo into BF.",
+			.. "WAIT (small pause). Typical binds: W A S D move, SPACE jump, skills on the "
+			.. "number row and letters like Q E R F. Keep it under %d tokens. "
+			.. "Situation: distanceStuds=%s, behindEnemy=%s, enemyBearing=%s, enemyMotion=%s, "
+			.. "enemySpeed=%s, mySpeed=%s, myHealth=%s, enemyHealth=%s. "
+			.. "Chase when they retreat, DASH when they close fast, get behind them, combo into BF.",
 		CONFIG.MAX_COMBO_INPUTS,
 		tostring(state.distance),
 		tostring(state.behind),
@@ -386,7 +468,6 @@ local function askAI(state)
 	end)
 	if not reqOk or type(res) ~= "table" or not res.Body then return nil end
 
-	-- Response may be OpenAI-style JSON or plain text; handle both.
 	local content
 	local decoded
 	pcall(function() decoded = HttpService:JSONDecode(res.Body) end)
@@ -395,7 +476,6 @@ local function askAI(state)
 	end
 	content = string.upper(content or res.Body or "")
 
-	-- Pull out valid tokens in order, ignoring any extra prose the model adds.
 	local combo = {}
 	for word in string.gmatch(content, "[%w]+") do
 		if VALID_TOKENS[word] then
@@ -407,7 +487,6 @@ local function askAI(state)
 	return combo
 end
 
--- Execute a combo token by token, bailing out if we get disabled mid-combo.
 local function executeCombo(combo)
 	for _, token in ipairs(combo) do
 		if destroyed or not enabled then break end
@@ -416,7 +495,6 @@ local function executeCombo(combo)
 	end
 end
 
--- Whether the AI controller is actually driving (needs HTTP support).
 local function aiActive()
 	return CONFIG.USE_AI_MOVEMENT and httpRequest ~= nil
 end
@@ -429,13 +507,11 @@ if CONFIG.USE_AI_MOVEMENT and not httpRequest then
 	)
 end
 
--- Optional AI combo layer. Runs on its own slow cadence and only ADDS skill
--- combos; it never gates the fast movement loop below, so it can't slow it.
 task.spawn(function()
 	while not destroyed do
 		if enabled and aiActive() then
 			local state = buildState()
-			if state then
+			if state and state.hasTarget then
 				local combo = askAI(state)
 				if combo then
 					executeCombo(combo)
@@ -443,59 +519,6 @@ task.spawn(function()
 			end
 		end
 		task.wait(CONFIG.AI_INTERVAL)
-	end
-end)
-
--- Fast local combat/movement loop on Heartbeat (runs every frame, network-free
--- and independent of window focus). It reads the live character positions each
--- frame, walks the character straight to a spot behind the enemy with
--- Humanoid:Move, and black-flashes the instant it is behind and in range.
-local lastFlankDash = 0
-local combatConnection
-combatConnection = RunService.Heartbeat:Connect(function()
-	if destroyed then return end
-	if not (enabled and CONFIG.USE_AUTO_COMBAT) then
-		stopMoving()
-		return
-	end
-
-	local myRoot, myHum = getMyRoot()
-	local targetRoot, dist
-	if myRoot then
-		targetRoot, dist = getNearestTarget(myRoot)
-	end
-
-	if not (myRoot and myHum and targetRoot) then
-		stopMoving()
-		return
-	end
-
-	-- Aim for a point directly behind the enemy (opposite their facing).
-	local behindOffset = targetRoot.CFrame.LookVector * (CONFIG.ATTACK_RANGE * 0.5)
-	local goalPos = targetRoot.Position - behindOffset
-	local toGoal = goalPos - myRoot.Position
-	toGoal = Vector3.new(toGoal.X, 0, toGoal.Z)
-
-	if toGoal.Magnitude > 2 then
-		pcall(function()
-			myHum:Move(toGoal.Unit, false)
-		end)
-	else
-		pcall(function()
-			myHum:Move(Vector3.new(0, 0, 0), false)
-		end)
-	end
-
-	-- Attack the instant we're behind and close. Spawn it so the black-flash
-	-- timing (task.wait) never stalls this per-frame movement handler.
-	if isBehind(myRoot, targetRoot) and dist <= CONFIG.ATTACK_RANGE then
-		task.spawn(tryBlackFlash)
-	elseif dist > CONFIG.ATTACK_RANGE and os.clock() - lastFlankDash >= CONFIG.FLANK_DASH_COOLDOWN then
-		-- Dash to close the gap faster while chasing.
-		lastFlankDash = os.clock()
-		task.spawn(function()
-			pressKey(CONFIG.DASH_KEY)
-		end)
 	end
 end)
 
@@ -509,7 +532,7 @@ screenGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
 screenGui.Parent = player:WaitForChild("PlayerGui")
 
 local frame = Instance.new("Frame")
-frame.Size = UDim2.new(0, 240, 0, 100)
+frame.Size = UDim2.new(0, 240, 0, 126)
 frame.Position = UDim2.new(1, -260, 0, 20)
 frame.BackgroundColor3 = Color3.fromRGB(20, 20, 20)
 frame.BackgroundTransparency = 0.1
@@ -527,7 +550,7 @@ stroke.Thickness = 1.5
 stroke.Parent = frame
 
 local title = Instance.new("TextLabel")
-title.Size = UDim2.new(1, -35, 0, 35)
+title.Size = UDim2.new(1, -35, 0, 32)
 title.Position = UDim2.new(0, 10, 0, 5)
 title.BackgroundTransparency = 1
 title.Text = "AUTO BLACK FLASH"
@@ -537,8 +560,8 @@ title.Font = Enum.Font.GothamBold
 title.Parent = frame
 
 local toggleButton = Instance.new("TextButton")
-toggleButton.Size = UDim2.new(0.88, 0, 0, 42)
-toggleButton.Position = UDim2.new(0.06, 0, 0, 48)
+toggleButton.Size = UDim2.new(0.88, 0, 0, 40)
+toggleButton.Position = UDim2.new(0.06, 0, 0, 44)
 toggleButton.BackgroundColor3 = Color3.fromRGB(0, 255, 100)
 toggleButton.Text = "ENABLED"
 toggleButton.TextColor3 = Color3.fromRGB(0, 0, 0)
@@ -549,6 +572,17 @@ toggleButton.Parent = frame
 local btnCorner = Instance.new("UICorner")
 btnCorner.CornerRadius = UDim.new(0, 10)
 btnCorner.Parent = toggleButton
+
+local status = Instance.new("TextLabel")
+status.Size = UDim2.new(0.88, 0, 0, 26)
+status.Position = UDim2.new(0.06, 0, 0, 90)
+status.BackgroundTransparency = 1
+status.Text = "idle"
+status.TextColor3 = Color3.fromRGB(180, 180, 180)
+status.TextScaled = true
+status.Font = Enum.Font.Gotham
+status.TextXAlignment = Enum.TextXAlignment.Center
+status.Parent = frame
 
 local closeButton = Instance.new("TextButton")
 closeButton.Size = UDim2.new(0, 28, 0, 28)
@@ -574,17 +608,50 @@ local function updateButton()
 	end
 end
 
-toggleButton.MouseButton1Click:Connect(function()
-	enabled = not enabled
+local function setEnabled(value)
+	enabled = value
 	updateButton()
-	notify("Auto Black Flash", enabled and "ENABLED ✅" or "DISABLED ❌", 2.5)
+	notify("Auto Black Flash", enabled and "ENABLED ✅" or "DISABLED ❌", 2)
+end
+
+toggleButton.MouseButton1Click:Connect(function()
+	setEnabled(not enabled)
 end)
 
 updateButton()
 
--- Dragging (supports both mouse and touch). Keep references to the global
--- UserInputService connections so they can be cleaned up on close instead of
--- firing forever against a destroyed frame.
+-- Live status readout (throttled; the Heartbeat loop stays lean).
+task.spawn(function()
+	while not destroyed do
+		if not enabled then
+			status.Text = "disabled"
+		else
+			local myRoot = getMyRoot()
+			local _, dist, _, targetPlayer = myRoot and getNearestTarget(myRoot)
+			if targetPlayer then
+				status.Text = ("%s • %dst%s"):format(
+					targetPlayer.Name,
+					math.floor(dist),
+					aiActive() and " • AI" or ""
+				)
+			else
+				status.Text = "searching…"
+			end
+		end
+		task.wait(0.2)
+	end
+end)
+
+------------------------------------------------------------------------
+-- Toggle keybind + dragging
+------------------------------------------------------------------------
+local keybindConn = UserInputService.InputBegan:Connect(function(input, gameProcessed)
+	if gameProcessed then return end
+	if input.KeyCode == CONFIG.TOGGLE_KEY then
+		setEnabled(not enabled)
+	end
+end)
+
 local dragging = false
 local dragStart
 local startPos
@@ -634,15 +701,10 @@ closeButton.MouseButton1Click:Connect(function()
 		combatConnection:Disconnect()
 		combatConnection = nil
 	end
-	stopMoving()
-	if inputChangedConn then
-		inputChangedConn:Disconnect()
-		inputChangedConn = nil
-	end
-	if inputEndedConn then
-		inputEndedConn:Disconnect()
-		inputEndedConn = nil
-	end
+	setControls(false) -- IMPORTANT: give the player their controls back
+	if keybindConn then keybindConn:Disconnect() end
+	if inputChangedConn then inputChangedConn:Disconnect() end
+	if inputEndedConn then inputEndedConn:Disconnect() end
 	screenGui:Destroy()
 end)
 --son im crine who even struggle to blackflash
