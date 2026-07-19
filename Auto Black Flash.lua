@@ -2,7 +2,6 @@
 	WARNING: Heads up! This script has not been verified by ScriptBlox. Use at your own risk!
 
 	Auto Black Flash
-	- Auto-counter: presses the black-flash key when a trigger animation plays.
 	- Auto-combat: finds the nearest player, gets behind them, presses the
 	  black-flash key, then side-dashes and repeats.
 
@@ -11,7 +10,6 @@
 local Players = game:GetService("Players")
 local VirtualInputManager = game:GetService("VirtualInputManager")
 local UserInputService = game:GetService("UserInputService")
-local RunService = game:GetService("RunService")
 local StarterGui = game:GetService("StarterGui")
 
 local player = Players.LocalPlayer
@@ -42,17 +40,8 @@ local CONFIG = {
 	LOOP_INTERVAL = 0.1,      -- delay between combat-loop iterations
 	PRESS_COOLDOWN = 0.25,    -- min time between key presses (shared)
 
-	-- Toggle each behaviour independently.
-	USE_AUTO_COUNTER = true,
+	-- Master switch for the positional auto-combat loop.
 	USE_AUTO_COMBAT = true,
-}
-
--- Trigger animations for the auto-counter (animId -> delay before pressing).
-local AnimationTriggers = {
-	["rbxassetid://100962226150441"] = 0.18,
-	["rbxassetid://95852624447551"] = 0.18,
-	["rbxassetid://74145636023952"] = 0.18,
-	["rbxassetid://72475960800126"] = 0.20,
 }
 ------------------------------------------------------------------------
 
@@ -75,7 +64,7 @@ notify(
 	6
 )
 
--- Shared cooldown so the counter and the combat loop can't stack presses.
+-- Cooldown so the combat loop can't stack presses on top of each other.
 local lastPress = 0
 
 local function pressKey(keyCode)
@@ -98,52 +87,6 @@ local function tryBlackFlash()
 	pressKey(CONFIG.BLACK_FLASH_KEY)
 	return true
 end
-
-------------------------------------------------------------------------
--- Auto-counter (animation based)
-------------------------------------------------------------------------
--- Track the current character's connection so respawning doesn't leak an
--- ever-growing pile of AnimationPlayed listeners.
-local animationConnection
-
-local function setupCharacter(character)
-	if not character then return end
-
-	if animationConnection then
-		animationConnection:Disconnect()
-		animationConnection = nil
-	end
-
-	local humanoid = character:WaitForChild("Humanoid", 5)
-	if not humanoid then return end
-	local animator = humanoid:WaitForChild("Animator", 5)
-	if not animator then return end
-
-	animationConnection = animator.AnimationPlayed:Connect(function(track)
-		if not enabled or not CONFIG.USE_AUTO_COUNTER then return end
-		local animation = track and track.Animation
-		if not animation then return end
-
-		local delayTime = AnimationTriggers[animation.AnimationId]
-		if not delayTime then return end
-
-		task.delay(delayTime, function()
-			if not enabled or not CONFIG.USE_AUTO_COUNTER then return end
-			if humanoid.Health <= 0 then return end
-			tryBlackFlash()
-		end)
-	end)
-end
-
--- Run the initial setup off the main thread so its WaitForChild calls don't
--- delay the rest of the script (notably GUI creation) by up to 10 seconds.
-if player.Character then
-	task.spawn(setupCharacter, player.Character)
-end
-player.CharacterAdded:Connect(function(char)
-	task.wait(0.3)
-	setupCharacter(char)
-end)
 
 ------------------------------------------------------------------------
 -- Auto-combat (positional): detect nearest player, get behind, hit, dash
@@ -357,10 +300,6 @@ end)
 closeButton.MouseButton1Click:Connect(function()
 	enabled = false
 	destroyed = true
-	if animationConnection then
-		animationConnection:Disconnect()
-		animationConnection = nil
-	end
 	if inputChangedConn then
 		inputChangedConn:Disconnect()
 		inputChangedConn = nil
