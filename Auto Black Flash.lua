@@ -62,10 +62,12 @@ local CONFIG = {
 	USE_AUTO_COMBAT = true,
 
 	-- Pollinations AI movement controller.
-	USE_AI_MOVEMENT = true,   -- let the AI decide movement each tick
+	USE_AI_MOVEMENT = true,   -- let the AI decide inputs each tick
 	AI_MODEL = "claude",      -- model name (see https://text.pollinations.ai/models)
 	AI_ENDPOINT = "https://text.pollinations.ai/openai",
 	AI_INTERVAL = 1.0,        -- seconds between AI decisions (keep >= ~0.8; it's a web call)
+	COMBO_STEP = 0.08,        -- delay between inputs within an AI combo
+	MAX_COMBO_INPUTS = 12,    -- safety cap on how many inputs one combo can fire
 }
 ------------------------------------------------------------------------
 
@@ -182,12 +184,62 @@ local function holdKey(keyCode, duration)
 	end)
 end
 
+-- Fire a single mouse-button click at the current cursor position.
+-- button: 0 = left (M1), 1 = right (M2).
+local function clickMouse(button)
+	local pos = UserInputService:GetMouseLocation()
+	pcall(function()
+		VirtualInputManager:SendMouseButtonEvent(pos.X, pos.Y, button, true, game, 0)
+	end)
+	task.wait()
+	pcall(function()
+		VirtualInputManager:SendMouseButtonEvent(pos.X, pos.Y, button, false, game, 0)
+	end)
+end
+
 ------------------------------------------------------------------------
--- AI movement controller (Pollinations AI, Claude model)
+-- AI combo controller (Pollinations AI, Claude model)
 ------------------------------------------------------------------------
--- The AI is only fast enough for high-level, ~1s decisions, so it picks one
--- action per tick from a fixed vocabulary and we execute it.
-local AI_ACTIONS = { WALK = true, LEFT = true, RIGHT = true, DASH = true, ATTACK = true, STOP = true }
+-- The AI drives raw inputs through VirtualInputManager. Each tick it returns
+-- a short sequence of input tokens (a combo) which we execute in order.
+
+-- Token -> KeyCode. Digits need naming because Enum.KeyCode["1"] doesn't exist.
+local KEY_MAP = {
+	W = Enum.KeyCode.W, A = Enum.KeyCode.A, S = Enum.KeyCode.S, D = Enum.KeyCode.D,
+	Q = Enum.KeyCode.Q, E = Enum.KeyCode.E, R = Enum.KeyCode.R, F = Enum.KeyCode.F,
+	T = Enum.KeyCode.T, G = Enum.KeyCode.G, C = Enum.KeyCode.C, V = Enum.KeyCode.V,
+	Z = Enum.KeyCode.Z, X = Enum.KeyCode.X, B = Enum.KeyCode.B, Y = Enum.KeyCode.Y,
+	SPACE = Enum.KeyCode.Space, SHIFT = Enum.KeyCode.LeftShift, CTRL = Enum.KeyCode.LeftControl,
+	["1"] = Enum.KeyCode.One, ["2"] = Enum.KeyCode.Two, ["3"] = Enum.KeyCode.Three,
+	["4"] = Enum.KeyCode.Four, ["5"] = Enum.KeyCode.Five, ["6"] = Enum.KeyCode.Six,
+	["7"] = Enum.KeyCode.Seven, ["8"] = Enum.KeyCode.Eight, ["9"] = Enum.KeyCode.Nine,
+	["0"] = Enum.KeyCode.Zero,
+}
+
+-- Every token the AI is allowed to use (keys above plus a few macros).
+local VALID_TOKENS = { M1 = true, M2 = true, DASH = true, BF = true, WALK = true, WAIT = true }
+for token in pairs(KEY_MAP) do
+	VALID_TOKENS[token] = true
+end
+
+-- Perform a single token through VirtualInputManager.
+local function pressToken(token)
+	if token == "M1" then
+		clickMouse(0)
+	elseif token == "M2" then
+		clickMouse(1)
+	elseif token == "DASH" then
+		sideDash()
+	elseif token == "BF" then
+		tryBlackFlash()
+	elseif token == "WALK" then
+		holdKey(CONFIG.WALK_KEY, CONFIG.WALK_HOLD)
+	elseif token == "WAIT" then
+		task.wait(CONFIG.COMBO_STEP)
+	elseif KEY_MAP[token] then
+		pressKey(KEY_MAP[token])
+	end
+end
 
 -- Build a compact snapshot of the situation for the prompt.
 local function buildState()
@@ -204,17 +256,20 @@ local function buildState()
 	}
 end
 
--- Ask Pollinations for a single action word. Returns the action or nil.
+-- Ask Pollinations for a combo. Returns an ordered list of valid tokens.
 local function askAI(state)
 	if not httpRequest then return nil end
 
 	local prompt = string.format(
-		"You control a Roblox fighting-game character. Reply with EXACTLY ONE word "
-			.. "from this list and nothing else: WALK, LEFT, RIGHT, DASH, ATTACK, STOP. "
-			.. "Meaning: WALK=move forward toward the enemy, LEFT/RIGHT=strafe, "
-			.. "DASH=dodge/reposition, ATTACK=black flash (only when behind and close), "
-			.. "STOP=stand still. Current state: hasTarget=%s, distanceStuds=%s, behindEnemy=%s. "
-			.. "Goal: chase the enemy, get behind them, then ATTACK.",
+		"You control a Roblox anime fighting-game character through VirtualInputManager. "
+			.. "Output a combo as a space-separated sequence of input tokens to run in order, "
+			.. "and NOTHING else. Valid tokens: W A S D (move), SPACE (jump), SHIFT (run), "
+			.. "Q E R F T G C V Z X B Y (skills/moves), 1 2 3 4 5 6 7 8 9 0 (skill slots), "
+			.. "M1 (light attack click), M2 (heavy/aim click), DASH (dodge), BF (black flash), "
+			.. "WAIT (small pause). Keep it under %d tokens. Chain moves into a real combo. "
+			.. "Situation: hasTarget=%s, distanceStuds=%s, behindEnemy=%s. "
+			.. "Goal: close in, get behind the enemy, then combo into BF.",
+		CONFIG.MAX_COMBO_INPUTS,
 		tostring(state.hasTarget),
 		tostring(state.distance),
 		tostring(state.behind)
@@ -248,27 +303,25 @@ local function askAI(state)
 	end
 	content = string.upper(content or res.Body or "")
 
-	for action in pairs(AI_ACTIONS) do
-		if string.find(content, action, 1, true) then
-			return action
+	-- Pull out valid tokens in order, ignoring any extra prose the model adds.
+	local combo = {}
+	for word in string.gmatch(content, "[%w]+") do
+		if VALID_TOKENS[word] then
+			combo[#combo + 1] = word
+			if #combo >= CONFIG.MAX_COMBO_INPUTS then break end
 		end
 	end
-	return nil
+	if #combo == 0 then return nil end
+	return combo
 end
 
-local function performAction(action)
-	if action == "WALK" then
-		holdKey(CONFIG.WALK_KEY, CONFIG.WALK_HOLD)
-	elseif action == "LEFT" then
-		holdKey(Enum.KeyCode.A, CONFIG.WALK_HOLD)
-	elseif action == "RIGHT" then
-		holdKey(Enum.KeyCode.D, CONFIG.WALK_HOLD)
-	elseif action == "DASH" then
-		sideDash()
-	elseif action == "ATTACK" then
-		tryBlackFlash()
+-- Execute a combo token by token, bailing out if we get disabled mid-combo.
+local function executeCombo(combo)
+	for _, token in ipairs(combo) do
+		if destroyed or not enabled then break end
+		pressToken(token)
+		task.wait(CONFIG.COMBO_STEP)
 	end
-	-- STOP / nil: do nothing this tick.
 end
 
 -- Whether the AI controller is actually driving (needs HTTP support).
@@ -289,9 +342,9 @@ task.spawn(function()
 		if enabled and aiActive() then
 			local state = buildState()
 			if state then
-				local action = askAI(state)
-				if action then
-					performAction(action)
+				local combo = askAI(state)
+				if combo then
+					executeCombo(combo)
 				end
 			end
 		end
