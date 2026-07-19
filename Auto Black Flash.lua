@@ -63,7 +63,7 @@ local CONFIG = {
 
 	-- Pollinations AI movement controller.
 	USE_AI_MOVEMENT = true,   -- let the AI decide inputs each tick
-	AI_MODEL = "Catniti/claude-sonnet-4.6", -- model name (see https://text.pollinations.ai/models)
+	AI_MODEL = "gpt-5.6-sol",  -- model name (see https://text.pollinations.ai/models)
 	AI_ENDPOINT = "https://text.pollinations.ai/openai",
 	AI_INTERVAL = 1.0,        -- seconds between AI decisions (keep >= ~0.8; it's a web call)
 	COMBO_STEP = 0.08,        -- delay between inputs within an AI combo
