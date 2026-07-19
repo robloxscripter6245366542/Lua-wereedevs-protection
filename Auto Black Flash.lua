@@ -16,6 +16,7 @@ local VirtualInputManager = game:GetService("VirtualInputManager")
 local UserInputService = game:GetService("UserInputService")
 local StarterGui = game:GetService("StarterGui")
 local HttpService = game:GetService("HttpService")
+local RunService = game:GetService("RunService")
 
 local player = Players.LocalPlayer
 
@@ -187,29 +188,15 @@ local function holdKey(keyCode, duration)
 	end)
 end
 
--- Continuous key-hold manager for smooth movement. setKey only sends an event
--- when the desired state actually changes, so a key stays held across ticks
--- instead of being re-pressed (which is what made movement stutter/lag).
-local heldKeys = {}
-local function setKey(keyCode, shouldHold)
-	if shouldHold and not heldKeys[keyCode] then
-		heldKeys[keyCode] = true
+-- Movement is driven through Humanoid:Move (world-space, reliable) instead of
+-- simulated W/A/D key signals, which executors often drop unless the Roblox
+-- window is focused. Stop the character by moving in no direction.
+local function stopMoving()
+	local char = player.Character
+	local hum = char and char:FindFirstChildOfClass("Humanoid")
+	if hum then
 		pcall(function()
-			VirtualInputManager:SendKeyEvent(true, keyCode, false, game)
-		end)
-	elseif not shouldHold and heldKeys[keyCode] then
-		heldKeys[keyCode] = nil
-		pcall(function()
-			VirtualInputManager:SendKeyEvent(false, keyCode, false, game)
-		end)
-	end
-end
-
-local function releaseAllHeld()
-	for keyCode in pairs(heldKeys) do
-		heldKeys[keyCode] = nil
-		pcall(function()
-			VirtualInputManager:SendKeyEvent(false, keyCode, false, game)
+			hum:Move(Vector3.new(0, 0, 0), false)
 		end)
 	end
 end
@@ -450,53 +437,56 @@ task.spawn(function()
 	end
 end)
 
--- Fast local combat/movement loop. Fully deterministic and network-free, so
--- movement stays responsive: it steers by holding W/A/D across ticks (no
--- re-pressing) and attacks the instant it gets behind the target.
+-- Fast local combat/movement loop on Heartbeat (runs every frame, network-free
+-- and independent of window focus). It reads the live character positions each
+-- frame, walks the character straight to a spot behind the enemy with
+-- Humanoid:Move, and black-flashes the instant it is behind and in range.
 local lastFlankDash = 0
-task.spawn(function()
-	while not destroyed do
-		if enabled and CONFIG.USE_AUTO_COMBAT then
-			local myRoot = getMyRoot()
-			local targetRoot, dist
-			if myRoot then
-				targetRoot, dist = getNearestTarget(myRoot)
-			end
+local combatConnection
+combatConnection = RunService.Heartbeat:Connect(function()
+	if destroyed then return end
+	if not (enabled and CONFIG.USE_AUTO_COMBAT) then
+		stopMoving()
+		return
+	end
 
-			if myRoot and targetRoot then
-				if dist > CONFIG.ATTACK_RANGE then
-					-- Chase: hold forward, no strafe.
-					setKey(CONFIG.WALK_KEY, true)
-					setKey(Enum.KeyCode.A, false)
-					setKey(Enum.KeyCode.D, false)
-				elseif isBehind(myRoot, targetRoot) then
-					-- Behind and in range: stop moving and black flash now.
-					setKey(CONFIG.WALK_KEY, false)
-					setKey(Enum.KeyCode.A, false)
-					setKey(Enum.KeyCode.D, false)
-					if tryBlackFlash() then
-						task.wait(CONFIG.HIT_TO_DASH_DELAY)
-					end
-				else
-					-- In range but facing them: circle to flank (forward + one
-					-- strafe direction) and dash around them periodically.
-					setKey(CONFIG.WALK_KEY, true)
-					setKey(Enum.KeyCode.A, dashLeft)
-					setKey(Enum.KeyCode.D, not dashLeft)
-					if os.clock() - lastFlankDash >= CONFIG.FLANK_DASH_COOLDOWN then
-						lastFlankDash = os.clock()
-						dashLeft = not dashLeft
-						pressKey(CONFIG.DASH_KEY)
-					end
-				end
-			else
-				-- No target (or dead): release everything so we don't drift.
-				releaseAllHeld()
-			end
-		else
-			releaseAllHeld()
-		end
-		task.wait(CONFIG.LOOP_INTERVAL)
+	local myRoot, myHum = getMyRoot()
+	local targetRoot, dist
+	if myRoot then
+		targetRoot, dist = getNearestTarget(myRoot)
+	end
+
+	if not (myRoot and myHum and targetRoot) then
+		stopMoving()
+		return
+	end
+
+	-- Aim for a point directly behind the enemy (opposite their facing).
+	local behindOffset = targetRoot.CFrame.LookVector * (CONFIG.ATTACK_RANGE * 0.5)
+	local goalPos = targetRoot.Position - behindOffset
+	local toGoal = goalPos - myRoot.Position
+	toGoal = Vector3.new(toGoal.X, 0, toGoal.Z)
+
+	if toGoal.Magnitude > 2 then
+		pcall(function()
+			myHum:Move(toGoal.Unit, false)
+		end)
+	else
+		pcall(function()
+			myHum:Move(Vector3.new(0, 0, 0), false)
+		end)
+	end
+
+	-- Attack the instant we're behind and close. Spawn it so the black-flash
+	-- timing (task.wait) never stalls this per-frame movement handler.
+	if isBehind(myRoot, targetRoot) and dist <= CONFIG.ATTACK_RANGE then
+		task.spawn(tryBlackFlash)
+	elseif dist > CONFIG.ATTACK_RANGE and os.clock() - lastFlankDash >= CONFIG.FLANK_DASH_COOLDOWN then
+		-- Dash to close the gap faster while chasing.
+		lastFlankDash = os.clock()
+		task.spawn(function()
+			pressKey(CONFIG.DASH_KEY)
+		end)
 	end
 end)
 
@@ -631,7 +621,11 @@ end)
 closeButton.MouseButton1Click:Connect(function()
 	enabled = false
 	destroyed = true
-	releaseAllHeld()
+	if combatConnection then
+		combatConnection:Disconnect()
+		combatConnection = nil
+	end
+	stopMoving()
 	if inputChangedConn then
 		inputChangedConn:Disconnect()
 		inputChangedConn = nil
