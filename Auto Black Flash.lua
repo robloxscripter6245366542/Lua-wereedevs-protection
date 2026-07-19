@@ -220,18 +220,24 @@ end
 -- The AI drives raw inputs through VirtualInputManager. Each tick it returns
 -- a short sequence of input tokens (a combo) which we execute in order.
 
--- Token -> KeyCode. Digits need naming because Enum.KeyCode["1"] doesn't exist.
-local KEY_MAP = {
-	W = Enum.KeyCode.W, A = Enum.KeyCode.A, S = Enum.KeyCode.S, D = Enum.KeyCode.D,
-	Q = Enum.KeyCode.Q, E = Enum.KeyCode.E, R = Enum.KeyCode.R, F = Enum.KeyCode.F,
-	T = Enum.KeyCode.T, G = Enum.KeyCode.G, C = Enum.KeyCode.C, V = Enum.KeyCode.V,
-	Z = Enum.KeyCode.Z, X = Enum.KeyCode.X, B = Enum.KeyCode.B, Y = Enum.KeyCode.Y,
-	SPACE = Enum.KeyCode.Space, SHIFT = Enum.KeyCode.LeftShift, CTRL = Enum.KeyCode.LeftControl,
+-- Token -> KeyCode covering the WHOLE keyboard. Built from every Enum.KeyCode
+-- (addressed by its name uppercased: A, F, SPACE, LEFTSHIFT, RETURN, F1 ...),
+-- then friendly aliases the model is likely to use (digits, SHIFT, ENTER ...).
+local KEY_MAP = {}
+for _, kc in ipairs(Enum.KeyCode:GetEnumItems()) do
+	KEY_MAP[string.upper(kc.Name)] = kc
+end
+local KEY_ALIASES = {
 	["1"] = Enum.KeyCode.One, ["2"] = Enum.KeyCode.Two, ["3"] = Enum.KeyCode.Three,
 	["4"] = Enum.KeyCode.Four, ["5"] = Enum.KeyCode.Five, ["6"] = Enum.KeyCode.Six,
 	["7"] = Enum.KeyCode.Seven, ["8"] = Enum.KeyCode.Eight, ["9"] = Enum.KeyCode.Nine,
 	["0"] = Enum.KeyCode.Zero,
+	SHIFT = Enum.KeyCode.LeftShift, CTRL = Enum.KeyCode.LeftControl,
+	ALT = Enum.KeyCode.LeftAlt, ENTER = Enum.KeyCode.Return, ESC = Enum.KeyCode.Escape,
 }
+for token, kc in pairs(KEY_ALIASES) do
+	KEY_MAP[token] = kc
+end
 
 -- Every token the AI is allowed to use (keys above plus a few macros).
 local VALID_TOKENS = { M1 = true, M2 = true, DASH = true, BF = true, WALK = true, WAIT = true }
@@ -338,10 +344,13 @@ local function askAI(state)
 	local prompt = string.format(
 		"You control a Roblox anime fighting-game character through VirtualInputManager. "
 			.. "Output a combo as a space-separated sequence of input tokens to run in order, "
-			.. "and NOTHING else. Valid tokens: W A S D (move), SPACE (jump), SHIFT (run), "
-			.. "Q E R F T G C V Z X B Y (skills/moves), 1 2 3 4 5 6 7 8 9 0 (skill slots), "
-			.. "M1 (light attack click), M2 (heavy/aim click), DASH (dodge), BF (black flash), "
-			.. "WAIT (small pause). Keep it under %d tokens. Chain moves into a real combo. "
+			.. "and NOTHING else. You have the WHOLE keyboard: any letter A-Z, any number "
+			.. "0-9, F1-F12, SPACE, SHIFT, CTRL, ALT, ENTER, ESC, TAB, and the arrow keys "
+			.. "(UP DOWN LEFT RIGHT) all press that key. Plus macros: M1 (light attack click), "
+			.. "M2 (heavy/aim click), DASH (dodge), BF (black flash), WALK (step forward), "
+			.. "WAIT (small pause). Typical binds: W A S D move, SPACE jump, and skills are "
+			.. "usually on the number row and letters like Q E R F. "
+			.. "Keep it under %d tokens. Chain inputs into a real combo. "
 			.. "Situation: distanceStuds=%s, behindEnemy=%s, enemyBearing=%s (where the enemy is "
 			.. "relative to the way I face), enemyMotion=%s, enemySpeed=%s, mySpeed=%s, "
 			.. "myHealth=%s, enemyHealth=%s. "
