@@ -18,9 +18,6 @@ local player = Players.LocalPlayer
 -- CONFIG  (edit these to match your game)
 ------------------------------------------------------------------------
 local CONFIG = {
-	-- Key that performs the black flash / attack.
-	BLACK_FLASH_KEY = Enum.KeyCode.Three,
-
 	-- Key that performs a dash/dodge in your game (Q is a common default).
 	DASH_KEY = Enum.KeyCode.Q,
 
@@ -35,11 +32,11 @@ local CONFIG = {
 	BEHIND_DOT = -0.25,
 
 	-- Timing.
-	BLACK_FLASH_GAP = 0.33,   -- gap between the first and second press of the key
-	HIT_TO_DASH_DELAY = 0.15, -- wait after pressing the key before dashing
+	BLACK_FLASH_GAP = 0.33,   -- gap between the first and second click
+	HIT_TO_DASH_DELAY = 0.15, -- wait after the black flash before dashing
 	DASH_HOLD = 0.12,         -- how long the strafe key is held during a dash
 	LOOP_INTERVAL = 0.1,      -- delay between combat-loop iterations
-	PRESS_COOLDOWN = 0.25,    -- min time between key presses (shared)
+	PRESS_COOLDOWN = 0.25,    -- min time between black-flash attempts
 
 	-- Master switch for the positional auto-combat loop.
 	USE_AUTO_COMBAT = true,
@@ -80,16 +77,25 @@ local function pressKey(keyCode)
 	end)
 end
 
--- Presses the black-flash key if the shared cooldown allows it. Returns
--- whether the press actually happened.
--- Black flash is a double-tap: press the key, then press it again after
--- BLACK_FLASH_GAP seconds.
+-- Fire a single left-mouse click at the current cursor position.
+local function clickMouse()
+	local pos = UserInputService:GetMouseLocation()
+	pcall(function()
+		VirtualInputManager:SendMouseButtonEvent(pos.X, pos.Y, 0, true, game, 0)
+	end)
+	task.wait()
+	pcall(function()
+		VirtualInputManager:SendMouseButtonEvent(pos.X, pos.Y, 0, false, game, 0)
+	end)
+end
+
+-- Black flash is a click, then another click BLACK_FLASH_GAP seconds later.
 local function tryBlackFlash()
 	if os.clock() - lastPress < CONFIG.PRESS_COOLDOWN then return false end
 	lastPress = os.clock()
-	pressKey(CONFIG.BLACK_FLASH_KEY)
+	clickMouse()
 	task.wait(CONFIG.BLACK_FLASH_GAP)
-	pressKey(CONFIG.BLACK_FLASH_KEY)
+	clickMouse()
 	lastPress = os.clock()
 	return true
 end
