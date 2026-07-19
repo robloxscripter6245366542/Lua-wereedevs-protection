@@ -4,6 +4,10 @@
 	Auto Black Flash
 	- Auto-combat: finds the nearest player, gets behind them, presses the
 	  black-flash key, then side-dashes and repeats.
+	- AI movement (optional): asks Pollinations AI (Claude model) what to do
+	  each tick and walks/strafes/dashes/attacks based on the reply. Falls
+	  back to the rule-based auto-combat if the executor can't make HTTP
+	  requests or the AI call fails.
 
 	Game binds differ, so edit the CONFIG block below to match your game.
 ]]
@@ -11,8 +15,17 @@ local Players = game:GetService("Players")
 local VirtualInputManager = game:GetService("VirtualInputManager")
 local UserInputService = game:GetService("UserInputService")
 local StarterGui = game:GetService("StarterGui")
+local HttpService = game:GetService("HttpService")
 
 local player = Players.LocalPlayer
+
+-- Executor HTTP request function (name varies between executors). Used only
+-- by the optional AI movement controller; nil on unsupported executors.
+local httpRequest = (syn and syn.request)
+	or (http and http.request)
+	or (fluxus and fluxus.request)
+	or http_request
+	or request
 
 ------------------------------------------------------------------------
 -- CONFIG  (edit these to match your game)
@@ -23,6 +36,9 @@ local CONFIG = {
 
 	-- Key that performs a dash/dodge in your game (Q is a common default).
 	DASH_KEY = Enum.KeyCode.Q,
+
+	-- Key that walks forward.
+	WALK_KEY = Enum.KeyCode.W,
 
 	-- How close (in studs) a player must be before auto-combat engages.
 	DETECT_RANGE = 40,
@@ -38,11 +54,18 @@ local CONFIG = {
 	BLACK_FLASH_GAP = 0.33,   -- gap between the first and second key press
 	HIT_TO_DASH_DELAY = 0.15, -- wait after the black flash before dashing
 	DASH_HOLD = 0.12,         -- how long the strafe key is held during a dash
+	WALK_HOLD = 0.35,         -- how long a walk/strafe step is held
 	LOOP_INTERVAL = 0.1,      -- delay between combat-loop iterations
 	PRESS_COOLDOWN = 0.25,    -- min time between black-flash attempts
 
 	-- Master switch for the positional auto-combat loop.
 	USE_AUTO_COMBAT = true,
+
+	-- Pollinations AI movement controller.
+	USE_AI_MOVEMENT = true,   -- let the AI decide movement each tick
+	AI_MODEL = "claude",      -- model name (see https://text.pollinations.ai/models)
+	AI_ENDPOINT = "https://text.pollinations.ai/openai",
+	AI_INTERVAL = 1.0,        -- seconds between AI decisions (keep >= ~0.8; it's a web call)
 }
 ------------------------------------------------------------------------
 
@@ -148,9 +171,139 @@ local function sideDash()
 	end)
 end
 
+-- Hold a key down for a fixed duration (used for walk/strafe steps).
+local function holdKey(keyCode, duration)
+	pcall(function()
+		VirtualInputManager:SendKeyEvent(true, keyCode, false, game)
+	end)
+	task.wait(duration)
+	pcall(function()
+		VirtualInputManager:SendKeyEvent(false, keyCode, false, game)
+	end)
+end
+
+------------------------------------------------------------------------
+-- AI movement controller (Pollinations AI, Claude model)
+------------------------------------------------------------------------
+-- The AI is only fast enough for high-level, ~1s decisions, so it picks one
+-- action per tick from a fixed vocabulary and we execute it.
+local AI_ACTIONS = { WALK = true, LEFT = true, RIGHT = true, DASH = true, ATTACK = true, STOP = true }
+
+-- Build a compact snapshot of the situation for the prompt.
+local function buildState()
+	local myRoot = getMyRoot()
+	if not myRoot then return nil end
+	local targetRoot, dist = getNearestTarget(myRoot)
+	if not targetRoot then
+		return { hasTarget = false }
+	end
+	return {
+		hasTarget = true,
+		distance = math.floor(dist),
+		behind = isBehind(myRoot, targetRoot),
+	}
+end
+
+-- Ask Pollinations for a single action word. Returns the action or nil.
+local function askAI(state)
+	if not httpRequest then return nil end
+
+	local prompt = string.format(
+		"You control a Roblox fighting-game character. Reply with EXACTLY ONE word "
+			.. "from this list and nothing else: WALK, LEFT, RIGHT, DASH, ATTACK, STOP. "
+			.. "Meaning: WALK=move forward toward the enemy, LEFT/RIGHT=strafe, "
+			.. "DASH=dodge/reposition, ATTACK=black flash (only when behind and close), "
+			.. "STOP=stand still. Current state: hasTarget=%s, distanceStuds=%s, behindEnemy=%s. "
+			.. "Goal: chase the enemy, get behind them, then ATTACK.",
+		tostring(state.hasTarget),
+		tostring(state.distance),
+		tostring(state.behind)
+	)
+
+	local ok, body = pcall(function()
+		return HttpService:JSONEncode({
+			model = CONFIG.AI_MODEL,
+			messages = { { role = "user", content = prompt } },
+			seed = math.random(1, 1000000),
+		})
+	end)
+	if not ok then return nil end
+
+	local reqOk, res = pcall(function()
+		return httpRequest({
+			Url = CONFIG.AI_ENDPOINT,
+			Method = "POST",
+			Headers = { ["Content-Type"] = "application/json" },
+			Body = body,
+		})
+	end)
+	if not reqOk or type(res) ~= "table" or not res.Body then return nil end
+
+	-- Response may be OpenAI-style JSON or plain text; handle both.
+	local content
+	local decoded
+	pcall(function() decoded = HttpService:JSONDecode(res.Body) end)
+	if decoded and decoded.choices and decoded.choices[1] and decoded.choices[1].message then
+		content = decoded.choices[1].message.content
+	end
+	content = string.upper(content or res.Body or "")
+
+	for action in pairs(AI_ACTIONS) do
+		if string.find(content, action, 1, true) then
+			return action
+		end
+	end
+	return nil
+end
+
+local function performAction(action)
+	if action == "WALK" then
+		holdKey(CONFIG.WALK_KEY, CONFIG.WALK_HOLD)
+	elseif action == "LEFT" then
+		holdKey(Enum.KeyCode.A, CONFIG.WALK_HOLD)
+	elseif action == "RIGHT" then
+		holdKey(Enum.KeyCode.D, CONFIG.WALK_HOLD)
+	elseif action == "DASH" then
+		sideDash()
+	elseif action == "ATTACK" then
+		tryBlackFlash()
+	end
+	-- STOP / nil: do nothing this tick.
+end
+
+-- Whether the AI controller is actually driving (needs HTTP support).
+local function aiActive()
+	return CONFIG.USE_AI_MOVEMENT and httpRequest ~= nil
+end
+
+if CONFIG.USE_AI_MOVEMENT and not httpRequest then
+	notify(
+		"Auto Black Flash",
+		"AI movement needs an executor with HTTP support.\nUsing rule-based combat instead.",
+		5
+	)
+end
+
 task.spawn(function()
 	while not destroyed do
-		if enabled and CONFIG.USE_AUTO_COMBAT then
+		if enabled and aiActive() then
+			local state = buildState()
+			if state then
+				local action = askAI(state)
+				if action then
+					performAction(action)
+				end
+			end
+		end
+		task.wait(CONFIG.AI_INTERVAL)
+	end
+end)
+
+task.spawn(function()
+	while not destroyed do
+		-- Rule-based combat runs when the AI controller isn't driving (either
+		-- disabled or unsupported on this executor).
+		if enabled and CONFIG.USE_AUTO_COMBAT and not aiActive() then
 			local myRoot = getMyRoot()
 			if myRoot then
 				local targetRoot, dist = getNearestTarget(myRoot)
