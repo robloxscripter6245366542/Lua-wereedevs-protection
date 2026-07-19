@@ -18,6 +18,9 @@ local player = Players.LocalPlayer
 -- CONFIG  (edit these to match your game)
 ------------------------------------------------------------------------
 local CONFIG = {
+	-- Key that performs the black flash / attack.
+	BLACK_FLASH_KEY = Enum.KeyCode.Three,
+
 	-- Key that performs a dash/dodge in your game (Q is a common default).
 	DASH_KEY = Enum.KeyCode.Q,
 
@@ -32,7 +35,7 @@ local CONFIG = {
 	BEHIND_DOT = -0.25,
 
 	-- Timing.
-	BLACK_FLASH_GAP = 0.33,   -- gap between the first and second click
+	BLACK_FLASH_GAP = 0.33,   -- gap between the first and second key press
 	HIT_TO_DASH_DELAY = 0.15, -- wait after the black flash before dashing
 	DASH_HOLD = 0.12,         -- how long the strafe key is held during a dash
 	LOOP_INTERVAL = 0.1,      -- delay between combat-loop iterations
@@ -77,25 +80,13 @@ local function pressKey(keyCode)
 	end)
 end
 
--- Fire a single left-mouse click at the current cursor position.
-local function clickMouse()
-	local pos = UserInputService:GetMouseLocation()
-	pcall(function()
-		VirtualInputManager:SendMouseButtonEvent(pos.X, pos.Y, 0, true, game, 0)
-	end)
-	task.wait()
-	pcall(function()
-		VirtualInputManager:SendMouseButtonEvent(pos.X, pos.Y, 0, false, game, 0)
-	end)
-end
-
--- Black flash is a click, then another click BLACK_FLASH_GAP seconds later.
+-- Black flash: press the key, then press it again BLACK_FLASH_GAP seconds later.
 local function tryBlackFlash()
 	if os.clock() - lastPress < CONFIG.PRESS_COOLDOWN then return false end
 	lastPress = os.clock()
-	clickMouse()
+	pressKey(CONFIG.BLACK_FLASH_KEY)
 	task.wait(CONFIG.BLACK_FLASH_GAP)
-	clickMouse()
+	pressKey(CONFIG.BLACK_FLASH_KEY)
 	lastPress = os.clock()
 	return true
 end
