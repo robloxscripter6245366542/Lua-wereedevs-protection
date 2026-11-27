@@ -1,0 +1,24 @@
+{
+  "name": "StealAnEgg",
+  "tree": {
+    "$className": "DataModel",
+    "ReplicatedStorage": {
+      "Shared": { "$path": "src/shared" }
+    },
+    "ServerScriptService": {
+      "Server": { "$path": "src/server" }
+    },
+    "StarterPlayer": {
+      "StarterPlayerScripts": {
+        "Client": { "$path": "src/client" }
+      }
+    },
+    "ServerStorage": {
+      "Models": {
+        "$className": "Folder",
+        "Eggs": { "$className": "Folder" },
+        "Pets": { "$className": "Folder" }
+      }
+    }
+  }
+}
