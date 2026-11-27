@@ -40,6 +40,33 @@ The game works with built-in procedural eggs and pets. To swap in real models, p
 `ServerStorage/Models/Eggs` (named by egg **Id**, e.g. `Lava`) or `ServerStorage/Models/Pets`
 (named by **pet name**, e.g. `Penguin`). They get auto-scaled, and any scripts inside are deleted for safety.
 
+### Custom Blender models (included)
+
+`models/` has an original low-poly model for **every egg (10) and every pet (29)**, made in Blender by
+`blender/make_models.py`. Each one is a single mesh with a tiny palette texture, so it's one MeshPart in
+Roblox, between 400 and 3,400 triangles.
+
+![pets](models/pets_preview.jpg)
+![eggs](models/eggs_preview.jpg)
+
+To import them:
+1. In Studio, use **File → Import 3D** (or Avatar → Import 3D) and pick e.g. `models/Pets/Fox.glb` (`.fbx` works too).
+2. Import it as a **Model**, rename it exactly like the pet (`Fox`), and drag it into `ServerStorage/Models/Pets`.
+   Eggs go into `ServerStorage/Models/Eggs`, named by egg Id (`Lava`, `Void`, ...).
+3. Done. The game scales it, positions it, and adds mutation sparkles automatically.
+
+The models face −Z, the same as the built-in ones. If one comes in turned around, rotate it 180° before saving it in ServerStorage.
+
+To change or add models, edit the `PETS` table / `make_eggs()` in the script, then rebuild:
+
+```bash
+blender -b -P blender/make_models.py -- models
+```
+
+Add `--only Fox Dragon` to rebuild just those, or `--no-render` to skip the previews.
+
+### Toolbox alternatives
+
 Toolbox picks from ForgeGUI search (insert by ID in Studio, then rename):
 
 | Use as | Toolbox model | Asset ID |
